@@ -2032,6 +2032,181 @@ impl From<Column> for DeltaColumn {
     }
 }
 
+/// --- Patch Traits to load with larger arrow types
+use delta_kernel::schema::{StructType, StructField, ArrayType, DataType, MapType, PrimitiveType,};
+use delta_kernel::arrow::datatypes::{Field as ArrowField};
+use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+
+const LIST_ARRAY_ROOT: &str = "element";
+const MAP_ROOT_DEFAULT: &str = "key_value";
+const MAP_KEY_DEFAULT: &str = "key";
+const MAP_VALUE_DEFAULT: &str = "value";
+
+#[derive(Clone, Copy, Default, Debug)]
+pub enum ArrowTypeSize {
+    #[default]
+    Normal,
+    Large,
+    View,
+}
+
+// Custom Delta->Arrow conversion trait
+pub trait TryFromKernelWithSize<S>: Sized {
+    type Error;
+    fn try_from_kernel_with_arrow_size(source: S, size: ArrowTypeSize) -> Result<Self, ArrowError>;
+}
+
+impl TryFromKernelWithSize<&StructType> for ArrowSchema {
+    type Error = ArrowError;
+
+    fn try_from_kernel_with_arrow_size(s: &StructType, size: ArrowTypeSize) -> Result<Self, ArrowError> {
+        let fields: Vec<ArrowField> = s
+            .fields()
+            .map(|v| ArrowField::try_from_kernel_with_arrow_size(v, size))
+            .try_collect()?;
+        Ok(ArrowSchema::new(fields))
+    }
+}
+
+impl TryFromKernelWithSize<&StructField> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from_kernel_with_arrow_size(f: &StructField, size: ArrowTypeSize) -> Result<Self, ArrowError> {
+        let metadata = f
+            .metadata()
+            .iter()
+            .map(|(key, val)| Ok((key.clone(), serde_json::to_string(val)?)))
+            .collect::<Result<_, serde_json::Error>>()
+            .map_err(|err| ArrowError::JsonError(err.to_string()))?;
+
+        let field = ArrowField::new(
+            f.name(),
+            ArrowDataType::try_from_kernel_with_arrow_size(f.data_type(), size)?,
+            f.is_nullable(),
+        )
+        .with_metadata(metadata);
+
+        Ok(field)
+    }
+}
+
+impl TryFromKernelWithSize<&ArrayType> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from_kernel_with_arrow_size(a: &ArrayType, size: ArrowTypeSize) -> Result<Self, ArrowError> {
+        Ok(ArrowField::new(
+            LIST_ARRAY_ROOT,
+            ArrowDataType::try_from_kernel_with_arrow_size(a.element_type(), size)?,
+            a.contains_null(),
+        ))
+    }
+}
+
+impl TryFromKernelWithSize<&MapType> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from_kernel_with_arrow_size(a: &MapType, size: ArrowTypeSize) -> Result<Self, ArrowError> {
+        Ok(ArrowField::new(
+            MAP_ROOT_DEFAULT,
+            ArrowDataType::Struct(
+                vec![
+                    ArrowField::new(
+                        MAP_KEY_DEFAULT,
+                        ArrowDataType::try_from_kernel_with_arrow_size(a.key_type(), size)?,
+                        false,
+                    ),
+                    ArrowField::new(
+                        MAP_VALUE_DEFAULT,
+                        ArrowDataType::try_from_kernel_with_arrow_size(a.value_type(), size)?,
+                        a.value_contains_null(),
+                    ),
+                ]
+                .into(),
+            ),
+            false, // always non-null
+        ))
+    }
+}
+
+impl TryFromKernelWithSize<&DataType> for ArrowDataType {
+    type Error = ArrowError;
+
+    fn try_from_kernel_with_arrow_size(t: &DataType, size: ArrowTypeSize) -> Result<Self, ArrowError> {
+        match t {
+            DataType::Primitive(p) => {
+                match p {
+                    PrimitiveType::String => match &size {
+                        ArrowTypeSize::Normal => Ok(ArrowDataType::Utf8),
+                        ArrowTypeSize::Large => Ok(ArrowDataType::LargeUtf8),
+                        ArrowTypeSize::View => Ok(ArrowDataType::Utf8View),
+                    },
+                    PrimitiveType::Long => Ok(ArrowDataType::Int64), // undocumented type
+                    PrimitiveType::Integer => Ok(ArrowDataType::Int32),
+                    PrimitiveType::Short => Ok(ArrowDataType::Int16),
+                    PrimitiveType::Byte => Ok(ArrowDataType::Int8),
+                    PrimitiveType::Float => Ok(ArrowDataType::Float32),
+                    PrimitiveType::Double => Ok(ArrowDataType::Float64),
+                    PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
+                    PrimitiveType::Binary => match &size {
+                        ArrowTypeSize::Normal => Ok(ArrowDataType::Binary),
+                        ArrowTypeSize::Large => Ok(ArrowDataType::LargeBinary),
+                        ArrowTypeSize::View => Ok(ArrowDataType::BinaryView),
+                    },
+                    PrimitiveType::Decimal(dtype) => Ok(ArrowDataType::Decimal128(
+                        dtype.precision(),
+                        dtype.scale() as i8, // 0..=38
+                    )),
+                    PrimitiveType::Date => {
+                        // A calendar date, represented as a year-month-day triple without a
+                        // timezone. Stored as 4 bytes integer representing days since 1970-01-01
+                        Ok(ArrowDataType::Date32)
+                    }
+                    // TODO: https://github.com/delta-io/delta/issues/643
+                    PrimitiveType::Timestamp => Ok(ArrowDataType::Timestamp(
+                        TimeUnit::Microsecond,
+                        Some("UTC".into()),
+                    )),
+                    PrimitiveType::TimestampNtz => {
+                        Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
+                    }
+                }
+            }
+            DataType::Struct(s) => Ok(ArrowDataType::Struct(
+                s.fields()
+                    .map(TryIntoArrow::try_into_arrow)
+                    .collect::<Result<Vec<ArrowField>, ArrowError>>()?
+                    .into(),
+            )),
+            DataType::Array(a) => match &size {
+                ArrowTypeSize::Normal => Ok(ArrowDataType::List(Arc::new(a.as_ref().try_into_arrow()?))),
+                ArrowTypeSize::Large => {
+                    Ok(ArrowDataType::LargeList(Arc::new(a.as_ref().try_into_arrow()?)))
+                }
+                ArrowTypeSize::View => Ok(ArrowDataType::LargeListView(Arc::new(
+                    a.as_ref().try_into_arrow()?,
+                ))),
+            },
+            DataType::Map(m) => Ok(ArrowDataType::Map(Arc::new(m.as_ref().try_into_arrow()?), false)),
+        }
+    }
+}
+
+/// Convert a kernel type into an arrow type (automatically implemented for all types that
+/// implement [`TryFromKernel`])
+pub trait TryIntoArrowWithSize<ArrowType> {
+    fn try_into_arrow_with_size(self, size: ArrowTypeSize) -> Result<ArrowType, ArrowError>;
+}
+
+impl<KernelType, ArrowType> TryIntoArrowWithSize<ArrowType> for KernelType
+where
+    ArrowType: TryFromKernelWithSize<KernelType>,
+{
+    fn try_into_arrow_with_size(self, size: ArrowTypeSize) -> Result<ArrowType, ArrowError> {
+        ArrowType::try_from_kernel_with_arrow_size(self, size)
+    }
+}
+/// ------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use crate::logstore::default_logstore::DefaultLogStore;

@@ -213,13 +213,13 @@ fn _arrow_schema(snapshot: &Snapshot, wrap_partitions: bool) -> DeltaResult<Arro
     let fields = schema
         .fields()
         .filter(|f| !meta.partition_columns().contains(&f.name().to_string()))
-        .map(|f| f.try_into_arrow())
+        .map(|f| f.try_into_arrow_with_size(ArrowTypeSize::Large))
         .chain(
             // We need stable order between logical and physical schemas, but the order of
             // partitioning columns is not always the same in the json schema and the array
             meta.partition_columns().iter().map(|partition_col| {
                 let f = schema.field(partition_col).unwrap();
-                let field: Field = f.try_into_arrow()?;
+                let field: Field = f.try_into_arrow_with_size(ArrowTypeSize::Large)?;
                 let corrected = if wrap_partitions {
                     match field.data_type() {
                         // Only dictionary-encode types that may be large

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use crate::delta_datafusion::TryIntoArrowWithSize as _;
 use crate::delta_datafusion::ArrowTypeSize;
 use delta_kernel::expressions::Scalar;

@@ -219,7 +219,7 @@ fn _arrow_schema(snapshot: &Snapshot, wrap_partitions: bool) -> DeltaResult<Arro
             // partitioning columns is not always the same in the json schema and the array
             meta.partition_columns().iter().map(|partition_col| {
                 let f = schema.field(partition_col).unwrap();
-                let field: Field = f.try_into_arrow_with_size(ArrowTypeSize::Large)?;
+                let field: Field = f.try_into_arrow()?;
                 let corrected = if wrap_partitions {
                     match field.data_type() {
                         // Only dictionary-encode types that may be large
@@ -2133,50 +2133,16 @@ impl TryFromKernelWithSize<&DataType> for ArrowDataType {
 
     fn try_from_kernel_with_arrow_size(t: &DataType, size: ArrowTypeSize) -> Result<Self, ArrowError> {
         match t {
-            DataType::Primitive(p) => {
-                match p {
-                    PrimitiveType::String => match &size {
-                        ArrowTypeSize::Normal => Ok(ArrowDataType::Utf8),
-                        ArrowTypeSize::Large => Ok(ArrowDataType::LargeUtf8),
-                        ArrowTypeSize::View => Ok(ArrowDataType::Utf8View),
-                    },
-                    PrimitiveType::Long => Ok(ArrowDataType::Int64), // undocumented type
-                    PrimitiveType::Integer => Ok(ArrowDataType::Int32),
-                    PrimitiveType::Short => Ok(ArrowDataType::Int16),
-                    PrimitiveType::Byte => Ok(ArrowDataType::Int8),
-                    PrimitiveType::Float => Ok(ArrowDataType::Float32),
-                    PrimitiveType::Double => Ok(ArrowDataType::Float64),
-                    PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
-                    PrimitiveType::Binary => match &size {
-                        ArrowTypeSize::Normal => Ok(ArrowDataType::Binary),
-                        ArrowTypeSize::Large => Ok(ArrowDataType::LargeBinary),
-                        ArrowTypeSize::View => Ok(ArrowDataType::BinaryView),
-                    },
-                    PrimitiveType::Decimal(dtype) => Ok(ArrowDataType::Decimal128(
-                        dtype.precision(),
-                        dtype.scale() as i8, // 0..=38
-                    )),
-                    PrimitiveType::Date => {
-                        // A calendar date, represented as a year-month-day triple without a
-                        // timezone. Stored as 4 bytes integer representing days since 1970-01-01
-                        Ok(ArrowDataType::Date32)
-                    }
-                    // TODO: https://github.com/delta-io/delta/issues/643
-                    PrimitiveType::Timestamp => Ok(ArrowDataType::Timestamp(
-                        TimeUnit::Microsecond,
-                        Some("UTC".into()),
-                    )),
-                    PrimitiveType::TimestampNtz => {
-                        Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
-                    }
-                }
-            }
-            DataType::Struct(s) => Ok(ArrowDataType::Struct(
-                s.fields()
-                    .map(TryIntoArrow::try_into_arrow)
-                    .collect::<Result<Vec<ArrowField>, ArrowError>>()?
-                    .into(),
-            )),
+            DataType::Primitive(PrimitiveType::String) => match &size {
+                ArrowTypeSize::Normal => Ok(ArrowDataType::Utf8),
+                ArrowTypeSize::Large => Ok(ArrowDataType::LargeUtf8),
+                ArrowTypeSize::View => Ok(ArrowDataType::Utf8View),
+            },
+            DataType::Primitive(PrimitiveType::Binary) => match &size {
+                ArrowTypeSize::Normal => Ok(ArrowDataType::Binary),
+                ArrowTypeSize::Large => Ok(ArrowDataType::LargeBinary),
+                ArrowTypeSize::View => Ok(ArrowDataType::BinaryView),
+            },
             DataType::Array(a) => match &size {
                 ArrowTypeSize::Normal => Ok(ArrowDataType::List(Arc::new(a.as_ref().try_into_arrow()?))),
                 ArrowTypeSize::Large => {
@@ -2186,7 +2152,7 @@ impl TryFromKernelWithSize<&DataType> for ArrowDataType {
                     a.as_ref().try_into_arrow()?,
                 ))),
             },
-            DataType::Map(m) => Ok(ArrowDataType::Map(Arc::new(m.as_ref().try_into_arrow()?), false)),
+            other => other.try_into_arrow(),
         }
     }
 }

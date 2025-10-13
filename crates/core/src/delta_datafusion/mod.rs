@@ -2033,14 +2033,9 @@ impl From<Column> for DeltaColumn {
 }
 
 /// --- Patch Traits to load with larger arrow types
-use delta_kernel::schema::{StructType, StructField, ArrayType, DataType, MapType, PrimitiveType,};
+use delta_kernel::schema::{StructType, StructField, DataType, PrimitiveType,};
 use delta_kernel::arrow::datatypes::{Field as ArrowField};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-
-const LIST_ARRAY_ROOT: &str = "element";
-const MAP_ROOT_DEFAULT: &str = "key_value";
-const MAP_KEY_DEFAULT: &str = "key";
-const MAP_VALUE_DEFAULT: &str = "value";
 
 #[derive(Clone, Copy, Default, Debug)]
 pub enum ArrowTypeSize {
@@ -2087,44 +2082,6 @@ impl TryFromKernelWithSize<&StructField> for ArrowField {
         .with_metadata(metadata);
 
         Ok(field)
-    }
-}
-
-impl TryFromKernelWithSize<&ArrayType> for ArrowField {
-    type Error = ArrowError;
-
-    fn try_from_kernel_with_arrow_size(a: &ArrayType, size: ArrowTypeSize) -> Result<Self, ArrowError> {
-        Ok(ArrowField::new(
-            LIST_ARRAY_ROOT,
-            ArrowDataType::try_from_kernel_with_arrow_size(a.element_type(), size)?,
-            a.contains_null(),
-        ))
-    }
-}
-
-impl TryFromKernelWithSize<&MapType> for ArrowField {
-    type Error = ArrowError;
-
-    fn try_from_kernel_with_arrow_size(a: &MapType, size: ArrowTypeSize) -> Result<Self, ArrowError> {
-        Ok(ArrowField::new(
-            MAP_ROOT_DEFAULT,
-            ArrowDataType::Struct(
-                vec![
-                    ArrowField::new(
-                        MAP_KEY_DEFAULT,
-                        ArrowDataType::try_from_kernel_with_arrow_size(a.key_type(), size)?,
-                        false,
-                    ),
-                    ArrowField::new(
-                        MAP_VALUE_DEFAULT,
-                        ArrowDataType::try_from_kernel_with_arrow_size(a.value_type(), size)?,
-                        a.value_contains_null(),
-                    ),
-                ]
-                .into(),
-            ),
-            false, // always non-null
-        ))
     }
 }
 

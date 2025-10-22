@@ -41,6 +41,7 @@ use object_store::ObjectStore;
 use serde_json::Deserializer;
 use tokio::task::spawn_blocking;
 use url::Url;
+use tracing::Instrument;
 
 use super::{Action, CommitInfo, Metadata, Protocol};
 use crate::kernel::arrow::engine_ext::{kernel_to_arrow, ExpressionEvaluatorExt};
@@ -87,6 +88,7 @@ impl Snapshot {
             }
             builder.build(engine.as_ref())
         })
+        .instrument(tracing::Span::current())
         .await
         .map_err(|e| DeltaTableError::Generic(e.to_string()))?
         {

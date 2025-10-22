@@ -81,14 +81,15 @@ impl Snapshot {
         config: DeltaTableConfig,
         version: Option<Version>,
     ) -> DeltaResult<Self> {
+        let span = tracing::info_span!("snapshot.try_new_with_engine.task");
         let snapshot = match spawn_blocking(move || {
+            let _enter = span.entered();
             let mut builder = KernelSnapshot::builder_for(table_root);
             if let Some(version) = version {
                 builder = builder.at_version(version);
             }
             builder.build(engine.as_ref())
         })
-        .instrument(tracing::Span::current())
         .await
         .map_err(|e| DeltaTableError::Generic(e.to_string()))?
         {

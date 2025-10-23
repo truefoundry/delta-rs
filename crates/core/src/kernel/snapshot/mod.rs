@@ -41,7 +41,7 @@ use object_store::ObjectStore;
 use serde_json::Deserializer;
 use tokio::task::spawn_blocking;
 use url::Url;
-use tracing::Instrument;
+use tracing::{instrument, Instrument};
 
 use super::{Action, CommitInfo, Metadata, Protocol};
 use crate::kernel::arrow::engine_ext::{kernel_to_arrow, ExpressionEvaluatorExt};
@@ -75,13 +75,14 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    #[instrument(skip(engine, table_root, config, version))]
     pub async fn try_new_with_engine(
         engine: Arc<dyn Engine>,
         table_root: Url,
         config: DeltaTableConfig,
         version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let span = tracing::info_span!("snapshot.try_new_with_engine.task");
+        let span = tracing::Span::current();
         let snapshot = match spawn_blocking(move || {
             let _enter = span.entered();
             let mut builder = KernelSnapshot::builder_for(table_root);

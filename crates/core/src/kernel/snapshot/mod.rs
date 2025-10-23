@@ -84,7 +84,7 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let span = tracing::Span::current();
         let snapshot = match spawn_blocking(move || {
-            let _enter = span.entered();
+            let _enter = span.enter();
             let mut builder = KernelSnapshot::builder_for(table_root);
             if let Some(version) = version {
                 builder = builder.at_version(version);

@@ -40,8 +40,8 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use serde_json::Deserializer;
 use tokio::task::spawn_blocking;
-use url::Url;
 use tracing::{instrument, Instrument};
+use url::Url;
 
 use super::{Action, CommitInfo, Metadata, Protocol};
 use crate::kernel::arrow::engine_ext::{kernel_to_arrow, ExpressionEvaluatorExt};
@@ -169,12 +169,17 @@ impl Snapshot {
         // TODO: bundle operation id with log store ...
         let engine = log_store.engine(None);
         let current = self.inner.clone();
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        let span = tracing::Span::current();
         let snapshot = spawn_blocking(move || {
-            let mut builder = KernelSnapshot::builder_from(current);
-            if let Some(version) = target_version {
-                builder = builder.at_version(version);
-            }
-            builder.build(engine.as_ref())
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                let mut builder = KernelSnapshot::builder_from(current);
+                if let Some(version) = target_version {
+                    builder = builder.at_version(version);
+                }
+                builder.build(engine.as_ref())
+            })
         })
         .await
         .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
@@ -403,14 +408,19 @@ impl Snapshot {
             }
         };
 
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        let span = tracing::Span::current();
         builder.spawn_blocking(move || {
-            for res in remove_data {
-                let batch = ArrowEngineData::try_from_engine_data(res?.actions)?.into();
-                if tx.blocking_send(Ok(batch)).is_err() {
-                    break;
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                for res in remove_data {
+                    let batch = ArrowEngineData::try_from_engine_data(res?.actions)?.into();
+                    if tx.blocking_send(Ok(batch)).is_err() {
+                        break;
+                    }
                 }
-            }
-            Ok(())
+                Ok(())
+            })
         });
 
         builder
@@ -439,9 +449,16 @@ impl Snapshot {
         // TODO: bundle operation id with log store ...
         let engine = log_store.engine(None);
         let inner = self.inner.clone();
-        let version = spawn_blocking(move || inner.get_app_id_version(&app_id, engine.as_ref()))
-            .await
-            .map_err(|e| DeltaTableError::GenericError { source: e.into() })??;
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        let span = tracing::Span::current();
+        let version = spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                inner.get_app_id_version(&app_id, engine.as_ref())
+            })
+        })
+        .await
+        .map_err(|e| DeltaTableError::GenericError { source: e.into() })??;
         Ok(version)
     }
 
@@ -458,9 +475,16 @@ impl Snapshot {
         let engine = log_store.engine(None);
         let inner = self.inner.clone();
         let domain = domain.to_string();
-        let metadata = spawn_blocking(move || inner.get_domain_metadata(&domain, engine.as_ref()))
-            .await
-            .map_err(|e| DeltaTableError::GenericError { source: e.into() })??;
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        let span = tracing::Span::current();
+        let metadata = spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                inner.get_domain_metadata(&domain, engine.as_ref())
+            })
+        })
+        .await
+        .map_err(|e| DeltaTableError::GenericError { source: e.into() })??;
         Ok(metadata)
     }
 }

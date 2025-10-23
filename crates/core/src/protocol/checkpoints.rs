@@ -45,10 +45,15 @@ pub(crate) async fn create_checkpoint_for(
     let engine = log_store.engine(operation_id);
 
     let task_engine = engine.clone();
+    let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+    let span = tracing::Span::current();
     let snapshot = spawn_blocking(move || {
-        Snapshot::builder_for(table_root)
-            .at_version(version)
-            .build(task_engine.as_ref())
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _enter = span.enter();
+            Snapshot::builder_for(table_root)
+                .at_version(version)
+                .build(task_engine.as_ref())
+        })
     })
     .await
     .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
@@ -59,11 +64,16 @@ pub(crate) async fn create_checkpoint_for(
     let cp_path = Path::from_url_path(cp_url.path())?;
     let mut cp_data = cp_writer.checkpoint_data(engine.as_ref())?;
 
+    let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+    let span = tracing::Span::current();
     let (first_batch, mut cp_data) = spawn_blocking(move || {
-        let Some(first_batch) = cp_data.next() else {
-            return Err(DeltaTableError::Generic("No data".to_string()));
-        };
-        Ok((to_rb(first_batch?)?, cp_data))
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _enter = span.enter();
+            let Some(first_batch) = cp_data.next() else {
+                return Err(DeltaTableError::Generic("No data".to_string()));
+            };
+            Ok((to_rb(first_batch?)?, cp_data))
+        })
     })
     .await
     .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
@@ -82,11 +92,16 @@ pub(crate) async fn create_checkpoint_for(
 
     let mut current_batch;
     loop {
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        let span = tracing::Span::current();
         (current_batch, cp_data) = spawn_blocking(move || {
-            let Some(first_batch) = cp_data.next() else {
-                return Ok::<_, DeltaTableError>((None, cp_data));
-            };
-            Ok((Some(to_rb(first_batch?)?), cp_data))
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                let Some(first_batch) = cp_data.next() else {
+                    return Ok::<_, DeltaTableError>((None, cp_data));
+                };
+                Ok((Some(to_rb(first_batch?)?), cp_data))
+            })
         })
         .await
         .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
@@ -116,9 +131,16 @@ pub(crate) async fn create_checkpoint_for(
         last_modified: file_meta.last_modified.timestamp_millis(),
     };
 
-    spawn_blocking(move || cp_writer.finalize(engine.as_ref(), &file_meta, cp_data))
-        .await
-        .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
+    let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+    let span = tracing::Span::current();
+    spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _enter = span.enter();
+            cp_writer.finalize(engine.as_ref(), &file_meta, cp_data)
+        })
+    })
+    .await
+    .map_err(|e| DeltaTableError::Generic(e.to_string()))??;
 
     Ok(())
 }

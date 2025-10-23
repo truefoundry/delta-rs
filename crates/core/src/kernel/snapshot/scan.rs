@@ -133,13 +133,18 @@ impl Scan {
         let tx = builder.tx();
 
         let inner = self.inner.clone();
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        let span = tracing::Span::current();
         let blocking_iter = move || {
-            for res in inner.scan_metadata(engine.as_ref())? {
-                if tx.blocking_send(Ok(res?)).is_err() {
-                    break;
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                for res in inner.scan_metadata(engine.as_ref())? {
+                    if tx.blocking_send(Ok(res?)).is_err() {
+                        break;
+                    }
                 }
-            }
-            Ok(())
+                Ok(())
+            })
         };
 
         builder.spawn_blocking(blocking_iter);
@@ -172,18 +177,23 @@ impl Scan {
         // TODO: which capacity to choose?
         let mut builder = ReceiverStreamBuilder::<ScanMetadata>::new(100);
         let tx = builder.tx();
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        let span = tracing::Span::current();
         let scan_inner = move || {
-            for res in inner.scan_metadata_from(
-                engine.as_ref(),
-                existing_version,
-                Box::new(scan_row_iter),
-                existing_predicate,
-            )? {
-                if tx.blocking_send(Ok(res?)).is_err() {
-                    break;
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                for res in inner.scan_metadata_from(
+                    engine.as_ref(),
+                    existing_version,
+                    Box::new(scan_row_iter),
+                    existing_predicate,
+                )? {
+                    if tx.blocking_send(Ok(res?)).is_err() {
+                        break;
+                    }
                 }
-            }
-            Ok(())
+                Ok(())
+            })
         };
 
         builder.spawn_blocking(scan_inner);

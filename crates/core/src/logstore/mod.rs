@@ -660,8 +660,13 @@ pub async fn get_latest_version(
     let storage = log_store.engine(None).storage_handler();
     let log_root = log_store.log_root_url();
 
+    let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+    let span = tracing::Span::current();
     let segment = spawn_blocking(move || {
-        LogSegment::for_table_changes(storage.as_ref(), log_root, current_version as u64, None)
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _enter = span.enter();
+            LogSegment::for_table_changes(storage.as_ref(), log_root, current_version as u64, None)
+        })
     })
     .await
     .map_err(|e| DeltaTableError::Generic(e.to_string()))?

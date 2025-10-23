@@ -82,14 +82,17 @@ impl Snapshot {
         config: DeltaTableConfig,
         version: Option<Version>,
     ) -> DeltaResult<Self> {
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
         let span = tracing::Span::current();
         let snapshot = match spawn_blocking(move || {
-            let _enter = span.enter();
-            let mut builder = KernelSnapshot::builder_for(table_root);
-            if let Some(version) = version {
-                builder = builder.at_version(version);
-            }
-            builder.build(engine.as_ref())
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                let mut builder = KernelSnapshot::builder_for(table_root);
+                if let Some(version) = version {
+                    builder = builder.at_version(version);
+                }
+                builder.build(engine.as_ref())
+            })
         })
         .await
         .map_err(|e| DeltaTableError::Generic(e.to_string()))?

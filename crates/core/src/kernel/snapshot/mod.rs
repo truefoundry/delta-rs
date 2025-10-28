@@ -296,7 +296,7 @@ impl Snapshot {
     ///
     /// A stream of commit infos.
     // TODO: move outer error into stream.
-    pub async fn commit_infos(
+    pub(crate) async fn commit_infos(
         &self,
         log_store: &dyn LogStore,
         limit: Option<usize>,
@@ -554,7 +554,7 @@ impl EagerSnapshot {
     }
 
     /// Get the underlying snapshot
-    pub fn snapshot(&self) -> &Snapshot {
+    pub(crate) fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
 

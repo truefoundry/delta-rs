@@ -594,7 +594,6 @@ impl<'a> DeltaScanBuilder<'a> {
                 .entry(part.partition_values.clone())
                 .or_insert(0);
             let mut file_groups_key = part.partition_values.clone();
-
             file_groups_key.push(ScalarValue::UInt32(Some(*index)));
 
             let file_group = file_groups.entry(file_groups_key).or_default();

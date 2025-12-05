@@ -697,13 +697,17 @@ impl MergePlan {
                 )?);
                 let task_parameters = self.task_parameters.clone();
 
-                use crate::delta_datafusion::DataFusionMixins;
+                use crate::delta_datafusion::arrow_schema_with_size;
+                use crate::delta_datafusion::ArrowTypeSize;
                 use crate::delta_datafusion::DeltaScanConfigBuilder;
                 use crate::delta_datafusion::DeltaTableProvider;
 
                 let scan_config = DeltaScanConfigBuilder::default()
                     .with_file_column(false)
-                    .with_schema(snapshot.input_schema())
+                    .with_schema(arrow_schema_with_size(
+                        snapshot.snapshot(),
+                        ArrowTypeSize::Large,
+                    )?)
                     .build(snapshot)?;
 
                 // For each rewrite evaluate the predicate and then modify each expression
@@ -835,6 +839,9 @@ pub async fn create_merge_plan(
     writer_properties: WriterProperties,
     session: SessionState,
 ) -> Result<MergePlan, DeltaTableError> {
+    use crate::delta_datafusion::ArrowTypeSize;
+    use crate::delta_datafusion::TryIntoArrowWithSize as _;
+
     let target_size =
         target_size.unwrap_or_else(|| snapshot.table_properties().target_file_size().get());
     let partitions_keys = snapshot.metadata().partition_columns();
@@ -869,7 +876,12 @@ pub async fn create_merge_plan(
         predicate: serde_json::to_string(filters).ok(),
     };
     let file_schema = arrow_schema_without_partitions(
-        &Arc::new(snapshot.schema().as_ref().try_into_arrow()?),
+        &Arc::new(
+            snapshot
+                .schema()
+                .as_ref()
+                .try_into_arrow_with_size(ArrowTypeSize::Large)?,
+        ),
         partitions_keys,
     );
 

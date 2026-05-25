@@ -62,11 +62,23 @@ impl Default for DeltaTableConfig {
     fn default() -> Self {
         Self {
             require_files: true,
-            log_buffer_size: num_cpus::get() * 4,
+            log_buffer_size: get_log_buffer_size(),
             log_batch_size: 1024,
             io_runtime: None,
         }
     }
+}
+
+fn get_log_buffer_size() -> usize {
+    let default_log_buffer_size = num_cpus::get() * 4;
+    
+    let log_buffer_size = std::env::var("DELTA_LOG_BUFFER_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default_log_buffer_size);
+    
+    return log_buffer_size;
 }
 
 impl PartialEq for DeltaTableConfig {

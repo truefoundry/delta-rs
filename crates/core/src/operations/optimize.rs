@@ -622,13 +622,16 @@ impl SelectedFileScanFactory {
         session: &dyn Session,
         read_operation_id: Option<Uuid>,
     ) -> Result<Self, DeltaTableError> {
+        use crate::delta_datafusion::{ArrowTypeSize, arrow_schema_with_size};
+
         Ok(Self {
             snapshot: snapshot.clone(),
             log_store,
-            // Mirror the caller's DataFusion session flags so rewrite scans keep
-            // the same parquet/view type behavior as the rest of optimize.
             scan_config: DeltaScanConfig::new_from_session(session)
-                .with_schema(snapshot.input_schema()),
+                .with_schema(arrow_schema_with_size(
+                    snapshot.snapshot(),
+                    ArrowTypeSize::Large,
+                )?),
             read_operation_id,
         })
     }
@@ -1043,8 +1046,15 @@ pub async fn create_merge_plan(
         target_size,
         predicate: serde_json::to_string(filters).ok(),
     };
+    use crate::delta_datafusion::{ArrowTypeSize, TryIntoArrowWithSize as _};
+
     let file_schema = arrow_schema_without_partitions(
-        &Arc::new(snapshot.schema().as_ref().try_into_arrow()?),
+        &Arc::new(
+            snapshot
+                .schema()
+                .as_ref()
+                .try_into_arrow_with_size(ArrowTypeSize::Large)?,
+        ),
         partitions_keys,
     );
 

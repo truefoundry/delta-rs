@@ -610,6 +610,124 @@ impl From<Column> for DeltaColumn {
     }
 }
 
+use arrow_schema::ArrowError;
+use delta_kernel::arrow::datatypes::Field as ArrowField;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
+
+#[derive(Clone, Copy, Default, Debug)]
+pub enum ArrowTypeSize {
+    #[default]
+    Normal,
+    Large,
+    View,
+}
+
+pub trait TryFromKernelWithSize<S>: Sized {
+    type Error;
+    fn try_from_kernel_with_arrow_size(source: S, size: ArrowTypeSize) -> Result<Self, ArrowError>;
+}
+
+impl TryFromKernelWithSize<&StructType> for ArrowSchema {
+    type Error = ArrowError;
+
+    fn try_from_kernel_with_arrow_size(
+        s: &StructType,
+        size: ArrowTypeSize,
+    ) -> Result<Self, ArrowError> {
+        let fields: Vec<ArrowField> = s
+            .fields()
+            .map(|v| ArrowField::try_from_kernel_with_arrow_size(v, size))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ArrowSchema::new(fields))
+    }
+}
+
+impl TryFromKernelWithSize<&StructField> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from_kernel_with_arrow_size(
+        f: &StructField,
+        size: ArrowTypeSize,
+    ) -> Result<Self, ArrowError> {
+        let metadata = f
+            .metadata()
+            .iter()
+            .map(|(key, val)| Ok((key.clone(), serde_json::to_string(val)?)))
+            .collect::<Result<_, serde_json::Error>>()
+            .map_err(|err| ArrowError::JsonError(err.to_string()))?;
+
+        let field = ArrowField::new(
+            f.name(),
+            ArrowDataType::try_from_kernel_with_arrow_size(f.data_type(), size)?,
+            f.is_nullable(),
+        )
+        .with_metadata(metadata);
+
+        Ok(field)
+    }
+}
+
+impl TryFromKernelWithSize<&DataType> for ArrowDataType {
+    type Error = ArrowError;
+
+    fn try_from_kernel_with_arrow_size(
+        t: &DataType,
+        size: ArrowTypeSize,
+    ) -> Result<Self, ArrowError> {
+        match t {
+            DataType::Primitive(PrimitiveType::String) => match &size {
+                ArrowTypeSize::Normal => Ok(ArrowDataType::Utf8),
+                ArrowTypeSize::Large => Ok(ArrowDataType::LargeUtf8),
+                ArrowTypeSize::View => Ok(ArrowDataType::Utf8View),
+            },
+            DataType::Primitive(PrimitiveType::Binary) => match &size {
+                ArrowTypeSize::Normal => Ok(ArrowDataType::Binary),
+                ArrowTypeSize::Large => Ok(ArrowDataType::LargeBinary),
+                ArrowTypeSize::View => Ok(ArrowDataType::BinaryView),
+            },
+            DataType::Array(a) => match &size {
+                ArrowTypeSize::Normal => {
+                    Ok(ArrowDataType::List(Arc::new(a.as_ref().try_into_arrow()?)))
+                }
+                ArrowTypeSize::Large => Ok(ArrowDataType::LargeList(Arc::new(
+                    a.as_ref().try_into_arrow()?,
+                ))),
+                ArrowTypeSize::View => Ok(ArrowDataType::LargeListView(Arc::new(
+                    a.as_ref().try_into_arrow()?,
+                ))),
+            },
+            other => other.try_into_arrow(),
+        }
+    }
+}
+
+pub trait TryIntoArrowWithSize<ArrowType> {
+    fn try_into_arrow_with_size(self, size: ArrowTypeSize) -> Result<ArrowType, ArrowError>;
+}
+
+impl<KernelType, ArrowType> TryIntoArrowWithSize<ArrowType> for KernelType
+where
+    ArrowType: TryFromKernelWithSize<KernelType>,
+{
+    fn try_into_arrow_with_size(self, size: ArrowTypeSize) -> Result<ArrowType, ArrowError> {
+        ArrowType::try_from_kernel_with_arrow_size(self, size)
+    }
+}
+
+pub(crate) fn arrow_schema_with_size(
+    snapshot: &Snapshot,
+    size: ArrowTypeSize,
+) -> DeltaResult<ArrowSchemaRef> {
+    let schema = snapshot.schema().as_ref().try_into_arrow_with_size(size)?;
+    let arrow_schema = _arrow_schema(
+        Arc::new(schema),
+        snapshot.metadata().partition_columns(),
+        false,
+    );
+    Ok(arrow_schema)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::DeltaTable;

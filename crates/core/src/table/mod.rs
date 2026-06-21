@@ -200,6 +200,7 @@ impl DeltaTable {
     /// `max_version`.
     ///
     /// This API is forward-only. Use [`DeltaTable::load_version`] to load an older version.
+    #[tracing::instrument(skip(self), fields(max_version = ?max_version, table_uri = %self.log_store.root_url()))]
     pub async fn update_incremental(
         &mut self,
         max_version: Option<i64>,

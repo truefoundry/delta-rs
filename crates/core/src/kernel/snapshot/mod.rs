@@ -73,6 +73,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    #[tracing::instrument(skip(engine, config), fields(version = ?version, table_uri = %table_root))]
     pub async fn try_new_with_engine(
         engine: Arc<dyn Engine>,
         table_root: Url,
@@ -116,6 +117,7 @@ impl Snapshot {
     }
 
     /// Create a new [`Snapshot`] instance
+    #[tracing::instrument(skip(log_store, config), fields(version = ?version, table_uri = %log_store.root_url()))]
     pub async fn try_new(
         log_store: &dyn LogStore,
         config: DeltaTableConfig,
@@ -144,6 +146,7 @@ impl Snapshot {
     }
 
     /// Update the snapshot to the given version
+    #[tracing::instrument(skip(self, engine), fields(target_version = ?target_version, current_version = self.version()))]
     pub async fn update(
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
@@ -541,6 +544,7 @@ pub(crate) async fn resolve_snapshot(
 
 impl EagerSnapshot {
     /// Create a new [`EagerSnapshot`] instance
+    #[tracing::instrument(skip(log_store, config), fields(version = ?version, table_uri = %log_store.root_url()))]
     pub async fn try_new(
         log_store: &dyn LogStore,
         config: DeltaTableConfig,
@@ -550,6 +554,7 @@ impl EagerSnapshot {
         Self::try_new_with_snapshot(log_store, snapshot.into()).await
     }
 
+    #[tracing::instrument(skip(log_store, snapshot), fields(version = snapshot.version(), require_files = snapshot.load_config().require_files))]
     pub(crate) async fn try_new_with_snapshot(
         log_store: &dyn LogStore,
         snapshot: Arc<Snapshot>,
@@ -587,6 +592,7 @@ impl EagerSnapshot {
     }
 
     /// Update the snapshot to the given version
+    #[tracing::instrument(skip(self, log_store), fields(target_version = ?target_version, current_version = self.version(), table_uri = %log_store.root_url()))]
     pub(crate) async fn update(
         &mut self,
         log_store: &dyn LogStore,

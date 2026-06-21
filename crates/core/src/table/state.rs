@@ -38,6 +38,7 @@ impl DeltaTableState {
     }
 
     /// Create a new DeltaTableState
+    #[tracing::instrument(skip(log_store, config), fields(version = ?version, table_uri = %log_store.root_url()))]
     pub async fn try_new(
         log_store: &dyn LogStore,
         config: DeltaTableConfig,
@@ -156,6 +157,7 @@ impl DeltaTableState {
     }
 
     /// Update the state of the table to the given version.
+    #[tracing::instrument(skip(self, log_store), fields(version = ?version, current_version = self.version(), table_uri = %log_store.root_url()))]
     pub async fn update(
         &mut self,
         log_store: &dyn LogStore,
@@ -192,6 +194,7 @@ impl DeltaTableState {
     // This is intentionally narrow: only detect a newer checkpoint for the
     // already-loaded table version. General checkpoint selection stays in the
     // snapshot/kernel update path.
+    #[tracing::instrument(skip(self, log_store), fields(current_version = current_version, loaded_checkpoint_version = ?loaded_checkpoint_version))]
     async fn should_reload_for_current_checkpoint(
         &self,
         log_store: &dyn LogStore,

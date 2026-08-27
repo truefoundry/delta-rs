@@ -412,7 +412,12 @@ const MAX_PARTITION_DICT_CARDINALITY: usize = (u16::MAX as usize) + 1;
 fn partitioned_files_to_file_groups(
     files: impl IntoIterator<Item = PartitionedFile>,
 ) -> Vec<FileGroup> {
-    partitioned_files_to_file_groups_with_limit(files, MAX_PARTITION_DICT_CARDINALITY)
+    let max_files_in_file_group: usize = std::env::var("MAX_FILES_IN_FILE_GROUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_PARTITION_DICT_CARDINALITY);
+
+    partitioned_files_to_file_groups_with_limit(files, max_files_in_file_group)
 }
 
 fn partitioned_files_to_file_groups_with_limit(

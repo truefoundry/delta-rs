@@ -275,6 +275,21 @@ impl DeltaTable {
         Ok(infos.into_iter().flatten())
     }
 
+    /// Returns a stream of provenance information, including the operation, user, and so on, for each write to a table.
+    /// The table history retention is based on the `logRetentionDuration` property of the Delta Table, 30 days by default.
+    /// If `limit` is given, this returns the information of the latest `limit` commits made to this table. Otherwise,
+    /// it returns all commits from the earliest commit.
+    pub async fn history_stream(
+        &self,
+        limit: Option<usize>,
+    ) -> DeltaResult<BoxStream<'_, DeltaResult<Option<CommitInfo>>>> {
+        self.snapshot()?
+            .snapshot()
+            .snapshot()
+            .commit_infos(&self.log_store(), limit)
+            .await
+    }
+
     #[cfg(test)]
     /// We have enough internal tests that just need to check the last commit of the table.
     ///

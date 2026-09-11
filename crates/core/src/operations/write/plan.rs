@@ -448,6 +448,7 @@ pub(super) async fn plan_overwrite_rewrite(
             let analysis = analyze_predicate_for_find_files(
                 predicate.clone(),
                 &prepared_write.exec_options.partition_columns,
+                Some(snapshot.table_configuration().logical_schema().as_ref()),
             )?;
             let mut diagnostics = RewriteDiagnostics {
                 matched_file_count: 0,

@@ -8,7 +8,7 @@ use delta_kernel::expressions::{
     DecimalData, Expression, JunctionPredicate, JunctionPredicateOp, Predicate, Scalar,
     UnaryPredicate, UnaryPredicateOp,
 };
-use delta_kernel::schema::{DataType, DecimalType, PrimitiveType};
+use delta_kernel::schema::{DataType, DecimalType, PrimitiveType, StructField, StructType};
 
 use crate::kernel::scalars::ScalarExt;
 
@@ -16,11 +16,82 @@ use crate::kernel::scalars::ScalarExt;
 ///
 /// If the expression converts to a Delta predicate, returns it directly.
 /// Otherwise, wraps the expression as a boolean expression predicate.
+///
+/// When `schema` is provided, `get_field` on map/array columns is converted to
+/// [`Expression::Unknown`] instead of a nested [`Expression::Column`] path. Kernel
+/// cannot resolve map/array key paths for data skipping and would otherwise reject
+/// the predicate with "Predicate references unknown column".
 pub(crate) fn to_delta_predicate(expr: &Expr) -> Result<Predicate> {
-    match to_delta_expression(&normalize_delta_predicate_expr(expr)?)? {
+    to_delta_predicate_with_schema(expr, None)
+}
+
+/// Schema-aware variant of [`to_delta_predicate`].
+pub(crate) fn to_delta_predicate_with_schema(
+    expr: &Expr,
+    schema: Option<&StructType>,
+) -> Result<Predicate> {
+    match to_delta_expression_with_schema(&normalize_delta_predicate_expr(expr)?, schema)? {
         Expression::Predicate(pred) => Ok(pred.as_ref().clone()),
         expr => Ok(Predicate::BooleanExpression(expr)),
     }
+}
+
+/// Converts `expr` into a kernel predicate that is safe to push for data skipping.
+///
+/// Returns `None` when conversion fails, or when the converted predicate references
+/// columns that kernel cannot resolve (map/array paths, missing fields, whole-struct
+/// refs). Callers should keep an Inexact DataFusion post-scan filter in that case.
+pub(crate) fn try_kernel_pushdown_predicate(
+    expr: &Expr,
+    schema: &StructType,
+) -> Option<Predicate> {
+    let predicate = to_delta_predicate_with_schema(expr, Some(schema)).ok()?;
+    is_kernel_resolvable_predicate(&predicate, schema).then_some(predicate)
+}
+
+/// Returns true when every column reference in `predicate` can be resolved by kernel's
+/// data-skipping schema walk (struct nesting only; map/array fields are ineligible).
+pub(crate) fn is_kernel_resolvable_predicate(predicate: &Predicate, schema: &StructType) -> bool {
+    predicate
+        .references()
+        .into_iter()
+        .all(|col| is_kernel_skippable_column(schema, col))
+}
+
+/// Matches kernel [`GetReferencedFields`]: only primitive (and variant) leaves reached
+/// exclusively through struct fields are eligible for data skipping.
+fn is_kernel_skippable_column(schema: &StructType, col: &ColumnName) -> bool {
+    let mut current = schema;
+    let path = col.path();
+    if path.is_empty() {
+        return false;
+    }
+
+    for (idx, name) in path.iter().enumerate() {
+        let Some(field) = find_schema_field(current, name) else {
+            return false;
+        };
+        let is_leaf = idx + 1 == path.len();
+        match field.data_type() {
+            DataType::Primitive(_) | DataType::Variant(_) => return is_leaf,
+            DataType::Struct(inner) => {
+                if is_leaf {
+                    // Whole-struct references are not registered as skippable leaves.
+                    return false;
+                }
+                current = inner.as_ref();
+            }
+            // Maps and arrays are filtered out by kernel and never resolve references.
+            DataType::Map(_) | DataType::Array(_) => return false,
+        }
+    }
+    false
+}
+
+fn find_schema_field<'a>(schema: &'a StructType, name: &str) -> Option<&'a StructField> {
+    schema
+        .field(name)
+        .or_else(|| schema.fields().find(|f| f.name().eq_ignore_ascii_case(name)))
 }
 
 fn normalize_delta_predicate_expr(expr: &Expr) -> Result<Expr> {
@@ -75,6 +146,14 @@ fn rewrite_in_list_expr_for_kernel(in_list: &InList) -> Option<Expr> {
 
 /// Converts a DataFusion expression to a Delta kernel expression.
 pub(crate) fn to_delta_expression(expr: &Expr) -> Result<Expression> {
+    to_delta_expression_with_schema(expr, None)
+}
+
+/// Schema-aware variant of [`to_delta_expression`].
+pub(crate) fn to_delta_expression_with_schema(
+    expr: &Expr,
+    schema: Option<&StructType>,
+) -> Result<Expression> {
     match expr {
         Expr::Column(column) => Ok(Expression::Column(ColumnName::new([column.name.as_str()]))),
         Expr::Literal(scalar, _meta) => {
@@ -84,7 +163,7 @@ pub(crate) fn to_delta_expression(expr: &Expr) -> Result<Expression> {
             op: op @ (Operator::And | Operator::Or),
             ..
         }) => {
-            let preds = flatten_junction_expr(expr, *op)?;
+            let preds = flatten_junction_expr(expr, *op, schema)?;
             Ok(Expression::Predicate(Box::new(Predicate::Junction(
                 JunctionPredicate {
                     op: to_junction_op(*op),
@@ -98,9 +177,9 @@ pub(crate) fn to_delta_expression(expr: &Expr) -> Result<Expression> {
             right,
         }) => Ok(Expression::Predicate(Box::new(Predicate::Binary(
             BinaryPredicate {
-                left: Box::new(to_delta_expression(left.as_ref())?),
+                left: Box::new(to_delta_expression_with_schema(left.as_ref(), schema)?),
                 op: to_binary_predicate_op(*op)?,
-                right: Box::new(to_delta_expression(right.as_ref())?),
+                right: Box::new(to_delta_expression_with_schema(right.as_ref(), schema)?),
             },
         )))),
         Expr::BinaryExpr(BinaryExpr {
@@ -116,9 +195,9 @@ pub(crate) fn to_delta_expression(expr: &Expr) -> Result<Expression> {
             };
             Ok(Expression::Predicate(Box::new(Predicate::Not(Box::new(
                 Predicate::Binary(BinaryPredicate {
-                    left: Box::new(to_delta_expression(left.as_ref())?),
+                    left: Box::new(to_delta_expression_with_schema(left.as_ref(), schema)?),
                     op: to_binary_predicate_op(inverted)?,
-                    right: Box::new(to_delta_expression(right.as_ref())?),
+                    right: Box::new(to_delta_expression_with_schema(right.as_ref(), schema)?),
                 }),
             )))))
         }
@@ -128,47 +207,47 @@ pub(crate) fn to_delta_expression(expr: &Expr) -> Result<Expression> {
             right,
         }) => Ok(Expression::Predicate(Box::new(Predicate::Not(Box::new(
             Predicate::Binary(BinaryPredicate {
-                left: Box::new(to_delta_expression(left.as_ref())?),
+                left: Box::new(to_delta_expression_with_schema(left.as_ref(), schema)?),
                 op: to_binary_predicate_op(Operator::IsDistinctFrom)?,
-                right: Box::new(to_delta_expression(right.as_ref())?),
+                right: Box::new(to_delta_expression_with_schema(right.as_ref(), schema)?),
             }),
         ))))),
         Expr::BinaryExpr(BinaryExpr { op, left, right }) => {
             Ok(Expression::Binary(BinaryExpression {
-                left: Box::new(to_delta_expression(left.as_ref())?),
+                left: Box::new(to_delta_expression_with_schema(left.as_ref(), schema)?),
                 op: to_binary_op(*op)?,
-                right: Box::new(to_delta_expression(right.as_ref())?),
+                right: Box::new(to_delta_expression_with_schema(right.as_ref(), schema)?),
             }))
         }
         Expr::IsNull(expr) => Ok(Expression::Predicate(Box::new(Predicate::Unary(
             UnaryPredicate {
                 op: UnaryPredicateOp::IsNull,
-                expr: Box::new(to_delta_expression(expr.as_ref())?),
+                expr: Box::new(to_delta_expression_with_schema(expr.as_ref(), schema)?),
             },
         )))),
         Expr::IsNotNull(expr) => Ok(Expression::Predicate(Box::new(Predicate::Not(Box::new(
             Predicate::Unary(UnaryPredicate {
                 op: UnaryPredicateOp::IsNull,
-                expr: Box::new(to_delta_expression(expr.as_ref())?),
+                expr: Box::new(to_delta_expression_with_schema(expr.as_ref(), schema)?),
             }),
         ))))),
         Expr::Not(expr) => Ok(Expression::Predicate(Box::new(Predicate::Not(Box::new(
-            Predicate::BooleanExpression(to_delta_expression(expr.as_ref())?),
+            Predicate::BooleanExpression(to_delta_expression_with_schema(expr.as_ref(), schema)?),
         ))))),
         Expr::Between(between) => {
-            let expr = to_delta_expression(&between.expr)?;
+            let expr = to_delta_expression_with_schema(&between.expr, schema)?;
             let expression = Predicate::Junction(JunctionPredicate {
                 op: JunctionPredicateOp::Or,
                 preds: vec![
                     Predicate::Binary(BinaryPredicate {
                         left: Box::new(expr.clone()),
                         op: BinaryPredicateOp::LessThan,
-                        right: Box::new(to_delta_expression(&between.low)?),
+                        right: Box::new(to_delta_expression_with_schema(&between.low, schema)?),
                     }),
                     Predicate::Binary(BinaryPredicate {
                         left: Box::new(expr),
                         op: BinaryPredicateOp::GreaterThan,
-                        right: Box::new(to_delta_expression(&between.high)?),
+                        right: Box::new(to_delta_expression_with_schema(&between.high, schema)?),
                     }),
                 ],
             });
@@ -194,10 +273,16 @@ pub(crate) fn to_delta_expression(expr: &Expr) -> Result<Expression> {
                     other => other.schema_name().to_string(),
                 };
 
-                if let Expression::Column(ref col_name) = to_delta_expression(&scalar_fn.args[0])? {
-                    return Ok(Expression::Column(
-                        col_name.join(&ColumnName::new([field_name.as_str()])),
-                    ));
+                match to_delta_expression_with_schema(&scalar_fn.args[0], schema)? {
+                    Expression::Column(col_name) => {
+                        return convert_get_field_column(col_name, &field_name, schema);
+                    }
+                    Expression::Unknown(reason) => {
+                        return Ok(Expression::unknown(format!(
+                            "get_field on unsupported parent ({reason})"
+                        )));
+                    }
+                    _ => {}
                 }
             }
             plan_err!(
@@ -207,6 +292,61 @@ pub(crate) fn to_delta_expression(expr: &Expr) -> Result<Expression> {
         }
         _ => plan_err!("Cannot convert to kernel expression: {:?}", expr),
     }
+}
+
+/// Converts `get_field(parent_col, field)` into a kernel expression.
+///
+/// Struct field access becomes a nested [`ColumnName`]. Map/array key access becomes
+/// [`Expression::Unknown`] when schema is available, because those paths are not real
+/// nested columns and kernel rejects them for data skipping.
+fn convert_get_field_column(
+    col_name: ColumnName,
+    field_name: &str,
+    schema: Option<&StructType>,
+) -> Result<Expression> {
+    let Some(schema) = schema else {
+        // Without schema we cannot distinguish struct fields from map keys; preserve
+        // historical struct-path joining used by unit tests and callers without schema.
+        return Ok(Expression::Column(
+            col_name.join(&ColumnName::new([field_name])),
+        ));
+    };
+
+    match column_data_type(schema, &col_name) {
+        Some(DataType::Struct(_)) => Ok(Expression::Column(
+            col_name.join(&ColumnName::new([field_name])),
+        )),
+        Some(DataType::Map(_)) | Some(DataType::Array(_)) => Ok(Expression::unknown(format!(
+            "get_field on map/array column '{col_name}' is not eligible for kernel pushdown"
+        ))),
+        Some(other) => plan_err!(
+            "get_field parent '{col_name}' has non-struct type {other}; cannot convert to kernel column path"
+        ),
+        None => plan_err!(
+            "get_field parent '{col_name}' not found in schema; cannot convert to kernel column path"
+        ),
+    }
+}
+
+fn column_data_type<'a>(schema: &'a StructType, col: &ColumnName) -> Option<&'a DataType> {
+    let mut current = schema;
+    let path = col.path();
+    if path.is_empty() {
+        return None;
+    }
+
+    for (idx, name) in path.iter().enumerate() {
+        let field = find_schema_field(current, name)?;
+        let is_leaf = idx + 1 == path.len();
+        if is_leaf {
+            return Some(field.data_type());
+        }
+        match field.data_type() {
+            DataType::Struct(inner) => current = inner.as_ref(),
+            _ => return None,
+        }
+    }
+    None
 }
 
 pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar> {
@@ -311,16 +451,20 @@ fn to_binary_op(op: Operator) -> Result<BinaryExpressionOp> {
 }
 
 /// Helper function to flatten nested AND/OR expressions into a single junction expression
-fn flatten_junction_expr(expr: &Expr, target_op: Operator) -> Result<Vec<Predicate>> {
+fn flatten_junction_expr(
+    expr: &Expr,
+    target_op: Operator,
+    schema: Option<&StructType>,
+) -> Result<Vec<Predicate>> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { op, left, right }) if *op == target_op => {
-            let mut left_exprs = flatten_junction_expr(left.as_ref(), target_op)?;
-            let mut right_exprs = flatten_junction_expr(right.as_ref(), target_op)?;
+            let mut left_exprs = flatten_junction_expr(left.as_ref(), target_op, schema)?;
+            let mut right_exprs = flatten_junction_expr(right.as_ref(), target_op, schema)?;
             left_exprs.append(&mut right_exprs);
             Ok(left_exprs)
         }
         _ => {
-            let delta_expr = to_delta_predicate(expr)?;
+            let delta_expr = to_delta_predicate_with_schema(expr, schema)?;
             Ok(vec![delta_expr])
         }
     }
@@ -633,6 +777,99 @@ mod tests {
             to_delta_expression(&expr).unwrap(),
             Expression::Column(ColumnName::new(["a", "b.c"]))
         );
+    }
+
+    #[test]
+    fn test_map_get_field_becomes_unknown_with_schema() {
+        use delta_kernel::schema::{MapType, StructField};
+
+        let schema = StructType::try_new(vec![
+            StructField::nullable(
+                "SpanAttributesString",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+            ),
+            StructField::nullable("StatusCode", DataType::STRING),
+        ])
+        .unwrap();
+
+        let map_key = col("SpanAttributesString").field("tfy.error_type");
+        let converted =
+            to_delta_expression_with_schema(&map_key, Some(&schema)).unwrap();
+        assert!(
+            matches!(converted, Expression::Unknown(_)),
+            "map get_field should not become a nested Column, got {converted:?}"
+        );
+
+        // Equality on a map key must not produce a nested column path that kernel rejects.
+        let map_pred = map_key.clone().eq(lit("timeout"));
+        let predicate = to_delta_predicate_with_schema(&map_pred, Some(&schema)).unwrap();
+        assert!(
+            predicate.references().is_empty(),
+            "map key predicate should not reference fabricated nested columns: {:?}",
+            predicate.references()
+        );
+
+        // Standalone map-key predicates are convertible but not useful for skipping; mixed
+        // predicates with real columns should still push down the resolvable arms via Unknown.
+        assert!(try_kernel_pushdown_predicate(&map_pred, &schema).is_some());
+
+        let mixed = col("StatusCode")
+            .eq(lit("ERROR"))
+            .and(map_key.eq(lit("timeout")));
+        let pushed = try_kernel_pushdown_predicate(&mixed, &schema).unwrap();
+        let refs: Vec<_> = pushed.references().into_iter().collect();
+        assert_eq!(refs.len(), 1);
+        assert!(
+            refs[0]
+                .path()
+                .first()
+                .is_some_and(|n| n.eq_ignore_ascii_case("StatusCode")),
+            "expected StatusCode reference, got {:?}",
+            refs[0]
+        );
+    }
+
+    #[test]
+    fn test_struct_get_field_still_joins_with_schema() {
+        use delta_kernel::schema::StructField;
+
+        let schema = StructType::try_new(vec![StructField::nullable(
+            "a",
+            DataType::try_struct_type([StructField::nullable("b", DataType::INTEGER)]).unwrap(),
+        )])
+        .unwrap();
+
+        let expr = col("a").field("b");
+        assert_eq!(
+            to_delta_expression_with_schema(&expr, Some(&schema)).unwrap(),
+            Expression::Column(ColumnName::new(["a", "b"]))
+        );
+        assert!(try_kernel_pushdown_predicate(&expr.eq(lit(1)), &schema).is_some());
+    }
+
+    #[test]
+    fn test_map_column_is_null_not_kernel_pushable() {
+        use delta_kernel::schema::{MapType, StructField};
+
+        let schema = StructType::try_new(vec![StructField::nullable(
+            "Metadata",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                true,
+            ))),
+        )])
+        .unwrap();
+
+        // IS NOT NULL on a map column converts, but kernel cannot resolve map columns for
+        // skipping — do not push it.
+        let expr = col("Metadata").is_not_null();
+        assert!(to_delta_predicate_with_schema(&expr, Some(&schema)).is_ok());
+        assert!(try_kernel_pushdown_predicate(&expr, &schema).is_none());
     }
 
     #[test]

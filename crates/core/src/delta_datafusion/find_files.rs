@@ -22,7 +22,7 @@ use itertools::Itertools;
 use percent_encoding::percent_decode_str;
 use tracing::*;
 
-use crate::delta_datafusion::engine::to_delta_predicate;
+use crate::delta_datafusion::engine::{to_delta_predicate, try_kernel_pushdown_predicate};
 use crate::delta_datafusion::logical::LogicalPlanBuilderExt as _;
 use crate::delta_datafusion::table_provider::next::{FileSelection, MissingFilePolicy};
 use crate::delta_datafusion::{
@@ -74,6 +74,7 @@ pub(crate) async fn find_files(
             let analysis = analyze_predicate_for_find_files(
                 predicate.to_owned(),
                 snapshot.metadata().partition_columns(),
+                Some(snapshot.table_configuration().logical_schema().as_ref()),
             )?;
             let predicate = analysis.predicate();
 
@@ -263,6 +264,7 @@ pub(crate) fn extract_partition_only_predicate(
 pub(crate) fn analyze_predicate_for_find_files(
     predicate: Expr,
     partition_columns: &[String],
+    schema: Option<&delta_kernel::schema::StructType>,
 ) -> DeltaResult<FindFilesPredicateAnalysis> {
     let simplified_terms = simplify_predicates(split_conjunction_owned(predicate))?;
     let mut visitor = FindFilesExprProperties {
@@ -277,7 +279,10 @@ pub(crate) fn analyze_predicate_for_find_files(
 
     let translated_pruning_term_count = simplified_terms
         .iter()
-        .filter(|term| to_delta_predicate(term).is_ok())
+        .filter(|term| match schema {
+            Some(schema) => try_kernel_pushdown_predicate(term, schema).is_some(),
+            None => to_delta_predicate(term).is_ok(),
+        })
         .count();
 
     Ok(FindFilesPredicateAnalysis {
@@ -310,12 +315,14 @@ async fn collect_matching_files(
             .table_configuration()
             .metadata()
             .partition_columns(),
+        Some(snapshot.table_configuration().logical_schema().as_ref()),
     )?;
     let skipping_pred = analysis.simplified_terms.clone();
+    let schema = snapshot.table_configuration().logical_schema();
     let delta_predicate = Arc::new(Predicate::and_from(
         skipping_pred
             .iter()
-            .flat_map(|term| to_delta_predicate(term).ok()),
+            .filter_map(|term| try_kernel_pushdown_predicate(term, schema.as_ref())),
     ));
     let predicate = analysis.predicate();
 
@@ -1046,6 +1053,7 @@ mod tests {
                 .otherwise(lit(false))
                 .unwrap(),
             &["id".to_string()],
+            None,
         )
         .unwrap();
 

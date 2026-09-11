@@ -35,7 +35,7 @@ use tracing::debug;
 
 use crate::delta_datafusion::DeltaScanConfig;
 use crate::delta_datafusion::engine::{
-    to_datafusion_expr, to_delta_expression, to_delta_predicate,
+    to_datafusion_expr, try_kernel_pushdown_predicate,
 };
 use crate::delta_datafusion::table_provider::next::FILE_ID_COLUMN_DEFAULT;
 use crate::kernel::{Scan, Snapshot};
@@ -595,8 +595,12 @@ fn process_predicate<'a>(
     // into the parquet scan, if the table has materialized partition columns
     let _has_partition_data = config.is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
-    // Try to convert the expression into a kernel predicate
-    if let Ok(kernel_predicate) = to_delta_predicate(expr) {
+    // Try to convert the expression into a kernel predicate that kernel can resolve.
+    // Map/array key access and other non-skippable refs are excluded so scan setup does
+    // not fail with "Predicate references unknown column".
+    if let Some(kernel_predicate) =
+        try_kernel_pushdown_predicate(expr, config.logical_schema().as_ref())
+    {
         let (pushdown, parquet_predicate) = if only_partition_refs {
             // All references are to partition columns so the kernel
             // scan can fully handle the predicate and return exact results
@@ -673,11 +677,15 @@ fn rewrite_expression(expr: Expr, config: &TableConfiguration) -> Result<Expr> {
     let physical_schema = config.physical_schema().leaves(None);
     let (physical_names, _) = physical_schema.as_ref();
     let name_mapping: HashMap<_, _> = logical_names.iter().zip(physical_names).collect();
+    let schema = config.logical_schema();
     let transformed = expr.transform(|node| match &node {
         // Scalar functions might be field a field access for a nested column
         // (e.g. `a.b.c`), so we might be able to handle them here as well
         Expr::Column(_) | Expr::ScalarFunction(_) => {
-            let col_name = to_delta_expression(&node)?;
+            let col_name = crate::delta_datafusion::engine::to_delta_expression_with_schema(
+                &node,
+                Some(schema.as_ref()),
+            )?;
             if let Expression::Column(name) = &col_name {
                 if let Some(physical_name) = name_mapping.get(name) {
                     return Ok(Transformed::yes(to_datafusion_expr(
@@ -689,6 +697,14 @@ fn rewrite_expression(expr: Expr, config: &TableConfiguration) -> Result<Expr> {
                 } else {
                     return plan_err!("Column '{name}' not found in physical schema");
                 }
+            }
+            if matches!(col_name, Expression::Unknown(_)) {
+                // Map/array key access is not a nested column path and cannot be remapped.
+                // Fail so process_filters drops this parquet pushdown term; DataFusion keeps
+                // the Inexact post-scan filter for correctness.
+                return plan_err!(
+                    "Cannot remap map/array get_field expression for column mapping pushdown"
+                );
             }
             Ok(Transformed::no(node))
         }
@@ -1371,5 +1387,94 @@ mod tests {
             scan_plan.scan.physical_schema().to_string(),
             expected_schema.to_string()
         )
+    }
+
+    #[tokio::test]
+    async fn test_map_key_predicate_scan_succeeds() -> TestResult {
+        use crate::operations::create::CreateBuilder;
+        use crate::writer::{DeltaWriter, JsonWriter};
+        use datafusion::prelude::SessionContext;
+        use delta_kernel::schema::{DataType as KernelDataType, MapType, PrimitiveType, StructField};
+
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().to_str().unwrap();
+
+        let schema = delta_kernel::schema::StructType::try_new(vec![
+            StructField::new(
+                "StatusCode",
+                KernelDataType::Primitive(PrimitiveType::String),
+                true,
+            ),
+            StructField::new(
+                "SpanAttributesString",
+                KernelDataType::Map(Box::new(MapType::new(
+                    KernelDataType::Primitive(PrimitiveType::String),
+                    KernelDataType::Primitive(PrimitiveType::String),
+                    true,
+                ))),
+                true,
+            ),
+        ])?;
+
+        let mut table = CreateBuilder::new()
+            .with_location(path)
+            .with_columns(schema.fields().cloned())
+            .await?;
+
+        let mut writer = JsonWriter::for_table(&table)?;
+        writer
+            .write(vec![
+                serde_json::json!({
+                    "StatusCode": "ERROR",
+                    "SpanAttributesString": {"tfy.error_type": "timeout"}
+                }),
+                serde_json::json!({
+                    "StatusCode": "ERROR",
+                    "SpanAttributesString": {"tfy.error_type": "rate_limit"}
+                }),
+                serde_json::json!({
+                    "StatusCode": "OK",
+                    "SpanAttributesString": {"tfy.error_type": "timeout"}
+                }),
+            ])
+            .await?;
+        writer.flush_and_commit(&mut table).await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", table.table_provider().await?)?;
+
+        let batches = ctx
+            .sql(
+                r#"
+                SELECT "StatusCode", "SpanAttributesString"['tfy.error_type'] AS error_type
+                FROM t
+                WHERE "SpanAttributesString"['tfy.error_type'] IN ('timeout', 'rate_limit')
+                  AND "StatusCode" = 'ERROR'
+                "#,
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let expected = [
+            "+------------+------------+",
+            "| StatusCode | error_type |",
+            "+------------+------------+",
+            "| ERROR      | rate_limit |",
+            "| ERROR      | timeout    |",
+            "+------------+------------+",
+        ];
+        assert_batches_sorted_eq!(&expected, &batches);
+
+        // Map IS NOT NULL must not fail scan setup either.
+        let batches = ctx
+            .sql(r#"SELECT COUNT(*) AS cnt FROM t WHERE "SpanAttributesString" IS NOT NULL"#)
+            .await?
+            .collect()
+            .await?;
+        let expected = ["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
+        assert_batches_sorted_eq!(&expected, &batches);
+
+        Ok(())
     }
 }

@@ -1547,6 +1547,213 @@ mod local {
     }
 
     #[tokio::test]
+    async fn test_map_key_predicate_does_not_fail_kernel_scan() -> Result<()> {
+        // Regression: DataFusion represents map access as get_field, and delta-rs used to
+        // rewrite that into a nested kernel Column path. Kernel correctly rejects map key
+        // paths for data skipping ("Predicate references unknown column"). Queries must
+        // still succeed via DataFusion post-scan filtering.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path();
+
+        let fields: Vec<StructField> = vec![
+            StructField::new(
+                "StatusCode".to_string(),
+                DataType::Primitive(PrimitiveType::String),
+                true,
+            ),
+            StructField::new(
+                "SpanAttributesString".to_string(),
+                DataType::Map(Box::new(MapType::new(
+                    DataType::Primitive(PrimitiveType::String),
+                    DataType::Primitive(PrimitiveType::String),
+                    true,
+                ))),
+                true,
+            ),
+        ];
+        let schema = StructType::try_new(fields).unwrap();
+        let table = deltalake_core::DeltaTableBuilder::from_url(
+            Url::from_directory_path(path.canonicalize().unwrap()).unwrap(),
+        )?
+        .build()?;
+        table
+            .create()
+            .with_columns(schema.fields().cloned())
+            .await?;
+
+        let mut table = open_fs_path(path.to_str().unwrap());
+        table.load().await?;
+
+        let mut writer = JsonWriter::for_table(&table).unwrap();
+        writer
+            .write(vec![
+                serde_json::json!({
+                    "StatusCode": "ERROR",
+                    "SpanAttributesString": {"tfy.error_type": "timeout"}
+                }),
+                serde_json::json!({
+                    "StatusCode": "ERROR",
+                    "SpanAttributesString": {"tfy.error_type": "rate_limit"}
+                }),
+                serde_json::json!({
+                    "StatusCode": "OK",
+                    "SpanAttributesString": {"tfy.error_type": "timeout"}
+                }),
+            ])
+            .await
+            .unwrap();
+        writer.flush_and_commit(&mut table).await.unwrap();
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", table.table_provider().await?)?;
+
+        let batches = ctx
+            .sql(
+                r#"
+                SELECT "StatusCode", "SpanAttributesString"['tfy.error_type'] AS error_type
+                FROM t
+                WHERE "SpanAttributesString"['tfy.error_type'] IN ('timeout', 'rate_limit')
+                  AND "StatusCode" = 'ERROR'
+                "#,
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let expected = vec![
+            "+------------+------------+",
+            "| StatusCode | error_type |",
+            "+------------+------------+",
+            "| ERROR      | rate_limit |",
+            "| ERROR      | timeout    |",
+            "+------------+------------+",
+        ];
+        assert_batches_sorted_eq!(&expected, &batches);
+
+        // Map column null checks must also not crash scan setup.
+        let batches = ctx
+            .sql(r#"SELECT COUNT(*) AS cnt FROM t WHERE "SpanAttributesString" IS NOT NULL"#)
+            .await?
+            .collect()
+            .await?;
+        let expected = vec!["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
+        assert_batches_sorted_eq!(&expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_map_key_predicate_does_not_fail_dml() -> Result<()> {
+        // Regression: DELETE/UPDATE hand a best-effort kernel predicate built from the
+        // find-files terms to log replay. Map key access must be kept out of it, otherwise
+        // kernel rejects the whole predicate ("Predicate references unknown column").
+        use datafusion::functions::core::expr_ext::FieldAccessor;
+        use datafusion::logical_expr::ident;
+
+        async fn map_key_table(path: &std::path::Path) -> Result<DeltaTable> {
+            let schema = StructType::try_new(vec![
+                StructField::new(
+                    "StatusCode".to_string(),
+                    DataType::Primitive(PrimitiveType::String),
+                    true,
+                ),
+                StructField::new(
+                    "SpanAttributesString".to_string(),
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::Primitive(PrimitiveType::String),
+                        DataType::Primitive(PrimitiveType::String),
+                        true,
+                    ))),
+                    true,
+                ),
+            ])
+            .unwrap();
+            let table = deltalake_core::DeltaTableBuilder::from_url(
+                Url::from_directory_path(path.canonicalize().unwrap()).unwrap(),
+            )?
+            .build()?;
+            table
+                .create()
+                .with_columns(schema.fields().cloned())
+                .await?;
+
+            let mut table = open_fs_path(path.to_str().unwrap());
+            table.load().await?;
+
+            let mut writer = JsonWriter::for_table(&table).unwrap();
+            writer
+                .write(vec![
+                    serde_json::json!({
+                        "StatusCode": "ERROR",
+                        "SpanAttributesString": {"tfy.error_type": "timeout"}
+                    }),
+                    serde_json::json!({
+                        "StatusCode": "ERROR",
+                        "SpanAttributesString": {"tfy.error_type": "rate_limit"}
+                    }),
+                    serde_json::json!({
+                        "StatusCode": "OK",
+                        "SpanAttributesString": {"tfy.error_type": "timeout"}
+                    }),
+                ])
+                .await
+                .unwrap();
+            writer.flush_and_commit(&mut table).await.unwrap();
+            Ok(table)
+        }
+
+        async fn scan_all(table: &DeltaTable) -> Result<Vec<RecordBatch>> {
+            let ctx = SessionContext::new();
+            ctx.register_table("t", table.table_provider().await?)?;
+            ctx.sql(
+                r#"SELECT "StatusCode", "SpanAttributesString"['tfy.error_type'] AS error_type FROM t"#,
+            )
+            .await?
+            .collect()
+            .await
+        }
+
+        let error_type = || ident("SpanAttributesString").field("tfy.error_type");
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table = map_key_table(tmp_dir.path()).await?;
+        let (table, metrics) = table
+            .delete()
+            .with_predicate(error_type().eq(lit("timeout")))
+            .await?;
+        assert_eq!(metrics.num_deleted_rows, Some(2));
+        let expected = vec![
+            "+------------+------------+",
+            "| StatusCode | error_type |",
+            "+------------+------------+",
+            "| ERROR      | rate_limit |",
+            "+------------+------------+",
+        ];
+        assert_batches_sorted_eq!(&expected, &scan_all(&table).await?);
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table = map_key_table(tmp_dir.path()).await?;
+        let (table, metrics) = table
+            .update()
+            .with_predicate(error_type().eq(lit("rate_limit")))
+            .with_update("StatusCode", lit("RETRY"))
+            .await?;
+        assert_eq!(metrics.num_updated_rows, 1);
+        let expected = vec![
+            "+------------+------------+",
+            "| StatusCode | error_type |",
+            "+------------+------------+",
+            "| ERROR      | timeout    |",
+            "| OK         | timeout    |",
+            "| RETRY      | rate_limit |",
+            "+------------+------------+",
+        ];
+        assert_batches_sorted_eq!(&expected, &scan_all(&table).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_issue_2105() -> Result<()> {
         use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         let tmp_dir = tempfile::tempdir().unwrap();

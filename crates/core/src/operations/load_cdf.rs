@@ -527,12 +527,20 @@ impl CdfLoadBuilder {
             ..Default::default()
         };
 
+        let metadata_size_hint = parquet_options.global.metadata_size_hint;
         let mut cdc_source = ParquetSource::new(cdc_table_schema)
             .with_table_parquet_options(parquet_options.clone());
         let mut add_source = ParquetSource::new(add_table_schema)
             .with_table_parquet_options(parquet_options.clone());
         let mut remove_source =
             ParquetSource::new(remove_table_schema).with_table_parquet_options(parquet_options);
+
+        // ParquetSource ignores `metadata_size_hint` in its table options.
+        if let Some(metadata_size_hint) = metadata_size_hint {
+            cdc_source = cdc_source.with_metadata_size_hint(metadata_size_hint);
+            add_source = add_source.with_metadata_size_hint(metadata_size_hint);
+            remove_source = remove_source.with_metadata_size_hint(metadata_size_hint);
+        }
 
         if let Some(filters) = filters {
             cdc_source = cdc_source.with_predicate(Arc::clone(filters));

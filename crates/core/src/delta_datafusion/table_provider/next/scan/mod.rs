@@ -477,6 +477,10 @@ async fn get_read_plan(
         global: state.config().options().execution.parquet.clone(),
         ..Default::default()
     };
+    debug!(
+        metadata_size_hint = ?pq_options.global.metadata_size_hint,
+        "Delta scan parquet metadata size hint"
+    );
 
     let mut full_read_schema = SchemaBuilder::from(parquet_read_schema.as_ref().clone());
     full_read_schema.push(file_id_field.as_ref().clone().with_nullable(true));
@@ -499,6 +503,10 @@ async fn get_read_plan(
         let mut file_source = ParquetSource::new(table_schema)
             .with_table_parquet_options(pq_options.clone())
             .with_parquet_file_reader_factory(reader_factory);
+        // ParquetSource ignores `metadata_size_hint` in its table options.
+        if let Some(metadata_size_hint) = pq_options.global.metadata_size_hint {
+            file_source = file_source.with_metadata_size_hint(metadata_size_hint);
+        }
 
         // TODO(roeap); we might be able to also push selection vectors into the read plan
         // by creating parquet access plans. However we need to make sure this does not

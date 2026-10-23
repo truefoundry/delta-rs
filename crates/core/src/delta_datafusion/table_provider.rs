@@ -232,6 +232,14 @@ impl DeltaScanConfig {
         self.schema = Some(schema);
         self
     }
+
+    /// When true, Utf8/LargeUtf8 (and Binary variants) are rewritten to view types
+    /// for the parquet scan. Disable this when the caller needs LargeUtf8/LargeBinary
+    /// to survive into DataFusion (e.g. optimize Z-order sort/interleave).
+    pub fn with_schema_force_view_types(mut self, force: bool) -> Self {
+        self.schema_force_view_types = force;
+        self
+    }
 }
 
 /// Builder for a datafusion [TableProvider] for a Delta table

@@ -259,6 +259,82 @@ fn _arrow_schema(
     Arc::new(ArrowSchema::new(fields))
 }
 
+/// Recursively rewrite string/binary types to their Large (i64-offset) variants.
+///
+/// Used by optimize (compact / Z-order) so DataFusion sort/interleave and the rewrite
+/// writer do not hit Arrow `i32` offset overflow on fat Utf8/Binary columns
+/// (see delta-io/delta-rs#3790).
+pub fn upgrade_data_type_to_large_varlen(data_type: &ArrowDataType) -> ArrowDataType {
+    match data_type {
+        ArrowDataType::Utf8 | ArrowDataType::Utf8View => ArrowDataType::LargeUtf8,
+        ArrowDataType::Binary | ArrowDataType::BinaryView => ArrowDataType::LargeBinary,
+        ArrowDataType::List(field) | ArrowDataType::ListView(field) => {
+            let upgraded = field
+                .as_ref()
+                .clone()
+                .with_data_type(upgrade_data_type_to_large_varlen(field.data_type()));
+            ArrowDataType::LargeList(Arc::new(upgraded))
+        }
+        ArrowDataType::FixedSizeList(field, len) => {
+            let upgraded = field
+                .as_ref()
+                .clone()
+                .with_data_type(upgrade_data_type_to_large_varlen(field.data_type()));
+            ArrowDataType::FixedSizeList(Arc::new(upgraded), *len)
+        }
+        ArrowDataType::LargeList(field) | ArrowDataType::LargeListView(field) => {
+            let upgraded = field
+                .as_ref()
+                .clone()
+                .with_data_type(upgrade_data_type_to_large_varlen(field.data_type()));
+            ArrowDataType::LargeList(Arc::new(upgraded))
+        }
+        ArrowDataType::Struct(fields) => {
+            let upgraded = fields
+                .iter()
+                .map(|field| {
+                    Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(upgrade_data_type_to_large_varlen(field.data_type())),
+                    )
+                })
+                .collect();
+            ArrowDataType::Struct(upgraded)
+        }
+        ArrowDataType::Map(entries, keys_sorted) => {
+            let upgraded = entries
+                .as_ref()
+                .clone()
+                .with_data_type(upgrade_data_type_to_large_varlen(entries.data_type()));
+            ArrowDataType::Map(Arc::new(upgraded), *keys_sorted)
+        }
+        ArrowDataType::Dictionary(key, value) => ArrowDataType::Dictionary(
+            key.clone(),
+            Box::new(upgrade_data_type_to_large_varlen(value)),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Rewrite an Arrow schema so all Utf8/Binary (and nested) fields use Large variants.
+pub fn arrow_schema_with_large_varlen(schema: SchemaRef) -> ArrowSchemaRef {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(upgrade_data_type_to_large_varlen(field.data_type())),
+            )
+        })
+        .collect::<Vec<_>>();
+    Arc::new(ArrowSchema::new(fields))
+}
+
 pub(crate) fn files_matching_predicate<'a>(
     log_data: LogDataHandler<'a>,
     filters: &[Expr],
@@ -815,6 +891,30 @@ mod tests {
 
         assert_eq!(decoded_file_ids, selected_file_ids);
         assert_eq!(decoded_policy, "Ignore");
+    }
+
+    #[test]
+    fn upgrade_schema_to_large_varlen_rewrites_nested_strings() {
+        use arrow_schema::Field;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("s", ArrowDataType::Utf8, true),
+            Field::new(
+                "tags",
+                ArrowDataType::List(Arc::new(Field::new("element", ArrowDataType::Utf8, true))),
+                true,
+            ),
+            Field::new("n", ArrowDataType::Int64, false),
+        ]));
+        let upgraded = arrow_schema_with_large_varlen(schema);
+        assert_eq!(upgraded.field(0).data_type(), &ArrowDataType::LargeUtf8);
+        match upgraded.field(1).data_type() {
+            ArrowDataType::LargeList(inner) => {
+                assert_eq!(inner.data_type(), &ArrowDataType::LargeUtf8);
+            }
+            other => panic!("expected LargeList, got {other:?}"),
+        }
+        assert_eq!(upgraded.field(2).data_type(), &ArrowDataType::Int64);
     }
 
     #[tokio::test]

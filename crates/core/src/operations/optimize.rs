@@ -51,7 +51,8 @@ use super::write::writer::{PartitionWriter, PartitionWriterConfig};
 use super::{CustomExecuteHandler, Operation};
 use crate::delta_datafusion::{
     DataFusionMixins, DeltaScanConfig, DeltaScanNext, SessionFallbackPolicy, SessionResolveContext,
-    create_session_state_with_spill_config, resolve_session_state, update_datafusion_session,
+    arrow_schema_with_large_varlen, create_session_state_with_spill_config,
+    resolve_session_state, update_datafusion_session,
 };
 use crate::errors::{DeltaResult, DeltaTableError, unsupported_column_mapping_write};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, DEFAULT_RETRIES, PROTOCOL};
@@ -622,13 +623,17 @@ impl SelectedFileScanFactory {
         session: &dyn Session,
         read_operation_id: Option<Uuid>,
     ) -> Result<Self, DeltaTableError> {
+        // Force LargeUtf8/LargeBinary (i64 offsets) for the optimize scan so
+        // Z-order sort/interleave does not overflow on fat string columns
+        // (delta-io/delta-rs#3790). Disable schema_force_view_types so the scan
+        // does not rewrite LargeUtf8 → Utf8View before the sort.
+        let large_schema = arrow_schema_with_large_varlen(snapshot.input_schema());
         Ok(Self {
             snapshot: snapshot.clone(),
             log_store,
-            // Mirror the caller's DataFusion session flags so rewrite scans keep
-            // the same parquet/view type behavior as the rest of optimize.
             scan_config: DeltaScanConfig::new_from_session(session)
-                .with_schema(snapshot.input_schema()),
+                .with_schema_force_view_types(false)
+                .with_schema(large_schema),
             read_operation_id,
         })
     }
@@ -1043,10 +1048,12 @@ pub async fn create_merge_plan(
         target_size,
         predicate: serde_json::to_string(filters).ok(),
     };
-    let file_schema = arrow_schema_without_partitions(
+    // Match the LargeUtf8/LargeBinary scan schema so rewrite cast + parquet
+    // writer stay on i64-offset types through the whole optimize path.
+    let file_schema = arrow_schema_with_large_varlen(arrow_schema_without_partitions(
         &Arc::new(snapshot.schema().as_ref().try_into_arrow()?),
         partitions_keys,
-    );
+    ));
 
     Ok(MergePlan {
         operations,

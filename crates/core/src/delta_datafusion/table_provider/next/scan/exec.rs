@@ -700,7 +700,10 @@ impl ExecutionPlan for DeltaScanExec {
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         // Deletion vectors and row-indexes depend on the position of a row
         // within the file, reordering row group when any of these are either
-        // present or to be used will lead to incorrect results
+        // present or to be used will lead to incorrect results.
+        // Will need to handle column mapping separately, have kept it unsupported
+        // for now as we don't use them and they are not supported in filters
+        // pushdown as well
         if self.has_deletion_vectors()
             || self.scan_plan.contract.retained_row_index_field().is_some()
             || self

@@ -698,6 +698,9 @@ impl ExecutionPlan for DeltaScanExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        // Deletion vectors and row-indexes depend on the position of a row
+        // within the file, reordering row group when any of these are either
+        // present or to be used will lead to incorrect results
         if self.has_deletion_vectors()
             || self.scan_plan.contract.retained_row_index_field().is_some()
             || self
@@ -708,6 +711,8 @@ impl ExecutionPlan for DeltaScanExec {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
 
+        // We need to do this so that `ORDER BY Hour` is not adapted to
+        // `ORDER BY NULL` when adapting the sort order expression
         if order
             .iter()
             .any(|sort_expr| self.references_delta_materialized_column(&sort_expr.expr))
@@ -739,6 +744,9 @@ impl ExecutionPlan for DeltaScanExec {
         Ok(self
             .input
             .try_pushdown_sort(&adapted_order)?
+            // Doing this as sort elimination is not in scope of this PR
+            // For us `DataSourceExec` is anyways never going to return `Exact`
+            // as our files are not sorted and could be overlapping
             .into_inexact()
             .map(|new_input| Arc::new(self.with_new_input(new_input)) as Arc<dyn ExecutionPlan>))
     }

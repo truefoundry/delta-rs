@@ -82,9 +82,9 @@ use chrono::Utc;
 use conflict_checker::ConflictChecker;
 use delta_kernel::table_properties::TableProperties;
 use futures::future::BoxFuture;
+use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
 use object_store::ObjectStoreExt as _;
-use object_store::path::Path;
 use serde_json::Value;
 use tracing::*;
 use uuid::Uuid;
@@ -98,20 +98,25 @@ use crate::kernel::{
     Action, CommitInfo, EagerSnapshot, IsolationLevel, Metadata, Protocol, Transaction, Version,
 };
 use crate::logstore::ObjectStoreRef;
-use crate::logstore::{CommitOrBytes, LogStoreRef};
+use crate::logstore::{CommitOrBytes, LogStore, LogStoreRef};
 use crate::operations::CustomExecuteHandler;
-use crate::protocol::{DeltaOperation, operation_parameter_value};
 use crate::protocol::{cleanup_expired_logs_for, create_checkpoint_for};
+use crate::protocol::{operation_parameter_value, DeltaOperation};
 use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
-use crate::{DeltaResult, crate_version};
+use crate::{crate_version, DeltaResult};
 
 pub use self::conflict_checker::CommitConflictError;
+pub use self::observer::{
+    set_commit_conflict_observer, CommitConflictEvent, CommitConflictObserver,
+    CommitConflictOutcome,
+};
 pub use self::protocol::INSTANCE as PROTOCOL;
 
 #[cfg(test)]
 pub(crate) mod application;
 mod conflict_checker;
+mod observer;
 mod protocol;
 #[cfg(feature = "datafusion")]
 mod state;
@@ -435,11 +440,9 @@ fn assign_commit_info_metadata(
     for (key, value) in existing_info {
         app_metadata.entry(key).or_insert(value);
     }
-    debug_assert!(
-        RESERVED_COMMIT_INFO_KEYS
-            .iter()
-            .all(|key| !app_metadata.contains_key(*key))
-    );
+    debug_assert!(RESERVED_COMMIT_INFO_KEYS
+        .iter()
+        .all(|key| !app_metadata.contains_key(*key)));
 
     commit_info.info = app_metadata.clone();
 }
@@ -764,6 +767,22 @@ impl PreparedCommit<'_> {
     }
 }
 
+fn notify_commit_conflict(
+    log_store: &dyn LogStore,
+    operation: &DeltaOperation,
+    winner_operation: Option<&str>,
+    outcome: CommitConflictOutcome,
+    error: Option<&CommitConflictError>,
+) {
+    observer::notify(&CommitConflictEvent {
+        table_url: log_store.root_url(),
+        operation: operation.name(),
+        winner_operation,
+        outcome,
+        error,
+    });
+}
+
 impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
     type Output = DeltaResult<PostCommit>;
     type IntoFuture = BoxFuture<'a, Self::Output>;
@@ -844,6 +863,13 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                                 latest_version = latest_version,
                                 "table updated but max_retries is 0, failing immediately"
                             );
+                            notify_commit_conflict(
+                                this.log_store.as_ref(),
+                                &this.data.operation,
+                                None,
+                                CommitConflictOutcome::Exhausted,
+                                None,
+                            );
                             return Err(TransactionError::MaxCommitAttempts(
                                 this.max_retries as i32,
                             )
@@ -868,6 +894,10 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                                 (latest_version - steps) + 1,
                             )
                             .await?;
+                            let winner_operation = summary
+                                .commit_info
+                                .as_ref()
+                                .and_then(|info| info.operation.clone());
                             let transaction_info = TransactionInfo::try_new(
                                 read_snapshot.log_data(),
                                 this.data.operation.read_predicate(),
@@ -881,8 +911,21 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                             );
 
                             match conflict_checker.check_conflicts() {
-                                Ok(_) => {}
+                                Ok(()) => notify_commit_conflict(
+                                    this.log_store.as_ref(),
+                                    &this.data.operation,
+                                    winner_operation.as_deref(),
+                                    CommitConflictOutcome::Rebase,
+                                    None,
+                                ),
                                 Err(err) => {
+                                    notify_commit_conflict(
+                                        this.log_store.as_ref(),
+                                        &this.data.operation,
+                                        winner_operation.as_deref(),
+                                        CommitConflictOutcome::Abort,
+                                        Some(&err),
+                                    );
                                     error!(
                                         conflicts_checked = conflicts_checked,
                                         error = %err,
@@ -937,6 +980,13 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                             });
                         }
                         Err(TransactionError::VersionAlreadyExists(version)) => {
+                            notify_commit_conflict(
+                                this.log_store.as_ref(),
+                                &this.data.operation,
+                                None,
+                                CommitConflictOutcome::Retry,
+                                None,
+                            );
                             warn!(
                                 version = version,
                                 attempt = attempt_number,
@@ -960,6 +1010,13 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
                     }
                 }
 
+                notify_commit_conflict(
+                    this.log_store.as_ref(),
+                    &this.data.operation,
+                    None,
+                    CommitConflictOutcome::Exhausted,
+                    None,
+                );
                 error!(
                     max_retries = this.max_retries,
                     "exceeded maximum commit attempts"
@@ -1165,9 +1222,9 @@ mod tests {
 
     use super::*;
     use crate::kernel::IsolationLevel;
-    use crate::logstore::{LogStore, StorageConfig, default_logstore::DefaultLogStore};
+    use crate::logstore::{default_logstore::DefaultLogStore, LogStore, StorageConfig};
     use crate::protocol::SaveMode;
-    use object_store::{PutPayload, memory::InMemory};
+    use object_store::{memory::InMemory, PutPayload};
     use serde_json::json;
     use url::Url;
 

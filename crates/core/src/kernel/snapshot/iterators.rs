@@ -27,7 +27,9 @@ use crate::kernel::scalars::ScalarExt;
 use crate::kernel::{Add, DeletionVectorDescriptor, Remove};
 use crate::{DeltaResult, DeltaTableError};
 
-pub(crate) use self::scan_row::{ScanRowOutStream, scan_row_in_eval};
+pub(crate) use self::scan_row::{
+    STATS_PARSED_NOT_REUSABLE, ScanRowOutStream, scan_row_in_eval, scan_row_with_stats_in_eval,
+};
 
 mod scan_row;
 mod tombstones;

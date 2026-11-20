@@ -240,6 +240,7 @@ fn physical_column_name(
 ///    nullCount: <derived null count schema>,
 ///    minValues: <derived min/max schema>,
 ///    maxValues: <derived min/max schema>,
+///    tightBounds: boolean,
 /// }
 /// ```
 pub(crate) fn stats_schema(
@@ -270,6 +271,13 @@ pub(crate) fn stats_schema(
             fields.push(StructField::nullable("minValues", min_max_schema.clone()));
             fields.push(StructField::nullable("maxValues", min_max_schema));
         }
+    }
+
+    // Match the kernel's expected stats schema, so a stored `stats_parsed` covers every leaf a
+    // kernel scan asks for and can be reused instead of re-parsing the JSON stats. With reuse
+    // off, keep the original schema.
+    if crate::kernel::snapshot::stats_reuse_enabled() {
+        fields.push(StructField::nullable("tightBounds", DataType::BOOLEAN));
     }
 
     StructType::try_new(fields).expect("Failed to construct StructType for stats_schema")
@@ -631,6 +639,7 @@ mod tests {
             StructField::nullable("nullCount", file_schema.clone()),
             StructField::nullable("minValues", file_schema.clone()),
             StructField::nullable("maxValues", file_schema),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ])
         .unwrap();
 
@@ -695,6 +704,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ])
         .unwrap();
 
@@ -739,6 +749,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ])
         .unwrap();
 
@@ -958,6 +969,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ])
         .unwrap();
 
@@ -1007,6 +1019,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ])
         .unwrap();
 
@@ -1069,6 +1082,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ])
         .unwrap();
 
@@ -1104,6 +1118,7 @@ mod tests {
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
             // No minValues or maxValues fields since no primitive fields are eligible
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ])
         .unwrap();
 
@@ -1145,6 +1160,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", min_max_without_payload.clone()),
             StructField::nullable("maxValues", min_max_without_payload),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ])
         .unwrap();
 

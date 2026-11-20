@@ -17,7 +17,7 @@ use url::Url;
 #[cfg(feature = "datafusion")]
 use super::MaterializedFiles;
 use super::stats_projection::{FileStatsMaterialization, StatsProjection, StatsSourcePolicy};
-use crate::kernel::{ReceiverStreamBuilder, scan_row_in_eval};
+use crate::kernel::{ReceiverStreamBuilder, scan_row_in_eval, scan_row_with_stats_in_eval};
 use crate::{DeltaResult, DeltaTableError};
 
 /// A boxed, `Send`able stream of [`ScanMetadata`] results produced while scanning a snapshot.
@@ -158,21 +158,18 @@ fn with_kernel_stats_output(
     builder: KernelScanBuilder,
     materialization: &FileStatsMaterialization,
 ) -> KernelScanBuilder {
-    let stats_opts = match materialization.stats_source_policy() {
-        StatsSourcePolicy::None => delta_kernel::scan::StatsOptions::none(),
-        StatsSourcePolicy::ParsedWithJsonFallback => match materialization.stats_projection() {
-            StatsProjection::None => delta_kernel::scan::StatsOptions::json_only(),
-            StatsProjection::Full | StatsProjection::PredicateColumns(_) => {
-                // Cached replay requires JSON stats in Kernel's base scan schema.
-                if materialization.preserves_raw_stats() {
-                    delta_kernel::scan::StatsOptions::all()
-                } else {
-                    // TODO: Pass selected columns to `StatsOptions::struct_columns`.
-                    delta_kernel::scan::StatsOptions::all_struct()
-                }
-            }
-            StatsProjection::NumRecordsOnly => delta_kernel::scan::StatsOptions::json_only(),
-        },
+    let stats_opts = if materialization.kernel_reads_struct_stats() {
+        // Cached replay requires JSON stats in Kernel's base scan schema.
+        if materialization.preserves_raw_stats() {
+            delta_kernel::scan::StatsOptions::all()
+        } else {
+            // TODO: Pass selected columns to `StatsOptions::struct_columns`.
+            delta_kernel::scan::StatsOptions::all_struct()
+        }
+    } else if materialization.stats_source_policy() == StatsSourcePolicy::None {
+        delta_kernel::scan::StatsOptions::none()
+    } else {
+        delta_kernel::scan::StatsOptions::json_only()
     };
 
     builder.with_stats(stats_opts)
@@ -503,13 +500,17 @@ impl Scan {
         match materialized_files.and_then(|materialized_files| materialized_files.full_table_seed())
         {
             Some(materialized_seed) => {
+                // The cheap check first: scans that don't ask for typed stats never reuse them.
+                let reuse_stats_parsed = self.stats_materialization.kernel_reads_struct_stats()
+                    && materialized_seed.stats_parsed_reusable(self.inner.snapshot());
                 let (existing_version, existing_data, existing_predicate) =
                     materialized_seed.into_parts();
-                self.scan_metadata_from(
+                self.scan_metadata_from_with_stats(
                     engine,
                     existing_version,
                     Box::new(existing_data),
                     existing_predicate,
+                    reuse_stats_parsed,
                 )
             }
             None => self.scan_metadata(engine),
@@ -528,12 +529,49 @@ impl Scan {
         existing_data: Box<T>,
         existing_predicate: Option<PredicateRef>,
     ) -> SendableScanMetadataStream {
+        self.scan_metadata_from_with_stats(
+            engine,
+            existing_version,
+            existing_data,
+            existing_predicate,
+            false,
+        )
+    }
+
+    /// Like [`Self::scan_metadata_from`]. With `reuse_stats_parsed`, every batch of
+    /// `existing_data` must carry `stats_parsed` in this snapshot's full parsed schema; the kernel
+    /// then reads it instead of parsing the JSON stats again, falling back to JSON when it is not
+    /// compatible with the scan's stats schema. Scans that don't ask the kernel for typed stats
+    /// (no stats-column predicate) never parse stats in replay, so the column isn't passed.
+    pub(crate) fn scan_metadata_from_with_stats<
+        T: Iterator<Item = RecordBatch> + Send + 'static,
+    >(
+        &self,
+        engine: Arc<dyn Engine>,
+        existing_version: Version,
+        existing_data: Box<T>,
+        existing_predicate: Option<PredicateRef>,
+        reuse_stats_parsed: bool,
+    ) -> SendableScanMetadataStream {
+        let reuse_stats_parsed =
+            reuse_stats_parsed && self.stats_materialization.kernel_reads_struct_stats();
+        tracing::debug!(
+            target: "deltalake::stats_reuse",
+            reuse = reuse_stats_parsed,
+            "seeded scan metadata"
+        );
         let inner = self.inner.clone();
         let snapshot = self.inner.snapshot().clone();
 
         // process our stored / cached data to conform to the expected input for log replay
-        let evaluator = match scan_row_in_eval(&snapshot) {
-            Ok(scan_row_in_eval) => scan_row_in_eval,
+        let evaluator = if reuse_stats_parsed {
+            scan_row_with_stats_in_eval(&snapshot)
+        } else {
+            scan_row_in_eval(&snapshot)
+                .map(|evaluator| (evaluator, delta_kernel::scan::scan_row_schema()))
+        };
+        let (evaluator, existing_data_schema) = match evaluator {
+            Ok(evaluator) => evaluator,
             Err(err) => return Box::pin(once(ready(Err(err)))),
         };
         // TODO: which capacity to choose?
@@ -557,6 +595,7 @@ impl Scan {
             for res in inner.scan_metadata_from(
                 engine.as_ref(),
                 existing_version,
+                existing_data_schema,
                 Box::new(scan_row_data),
                 existing_predicate,
             )? {

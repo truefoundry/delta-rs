@@ -33,6 +33,10 @@ use crate::kernel::snapshot::stats_projection::{
 };
 use crate::{DeltaResult, DeltaTableError};
 
+/// Field metadata on a stored `stats_parsed` column whose values must not replace a fresh parse.
+pub(crate) const STATS_PARSED_NOT_REUSABLE: &str = "delta-rs.stats_parsed.not_reusable";
+const TIGHT_BOUNDS: &str = "tightBounds";
+
 pin_project! {
     pub(crate) struct ScanRowOutStream<S> {
         stats_schema: KernelSchemaRef,
@@ -124,6 +128,36 @@ pub(crate) fn scan_row_in_eval(
     )?)
 }
 
+/// Like [`scan_row_in_eval`], but keeps the stored `stats_parsed` column so the kernel can reuse
+/// it instead of parsing the JSON stats again. Returns the evaluator and its output schema, which
+/// is the `existing_data_schema` the kernel needs.
+pub(crate) fn scan_row_with_stats_in_eval(
+    snapshot: &KernelSnapshot,
+) -> DeltaResult<(Arc<dyn ExpressionEvaluator>, KernelSchemaRef)> {
+    let input_schema = snapshot.scan_row_parsed_schema_arrow()?;
+    let input_schema: KernelSchemaRef = Arc::new(input_schema.as_ref().try_into_kernel()?);
+    let stats_parsed = input_schema
+        .field(FIELD_STATS_PARSED)
+        .ok_or_else(|| DeltaTableError::SchemaMismatch {
+            msg: "parsed scan row schema has no stats_parsed field".to_string(),
+        })?
+        .clone();
+    let output_schema: KernelSchemaRef = Arc::new(StructType::try_new(
+        scan_row_schema().fields().cloned().chain([stats_parsed]),
+    )?);
+    let expression = Expression::struct_from(
+        output_schema
+            .fields()
+            .map(|field| Expression::column([field.name.clone()])),
+    );
+    let evaluator = ARROW_HANDLER.new_expression_evaluator(
+        input_schema,
+        expression.into(),
+        DataType::Struct(Box::new(output_schema.as_ref().clone())),
+    )?;
+    Ok((evaluator, output_schema))
+}
+
 #[cfg(any(test, feature = "datafusion"))]
 pub(crate) fn parse_stats_column_with_schema(
     sn: &KernelSnapshot,
@@ -171,17 +205,22 @@ fn parse_stats_column_impl(
         columns.push(column.clone());
     }
 
-    if let Some(stats_array) = materialize_stats_array(
+    if let Some((stats_array, reusable)) = materialize_stats_array(
         batch,
         stats_schema,
         stats_arrow_fields,
         stats_materialization,
     )? {
-        fields.push(Arc::new(Field::new(
-            FIELD_STATS_PARSED,
-            stats_array.data_type().to_owned(),
-            true,
-        )));
+        let field = Field::new(FIELD_STATS_PARSED, stats_array.data_type().to_owned(), true);
+        let field = if reusable {
+            field
+        } else {
+            field.with_metadata(HashMap::from([(
+                STATS_PARSED_NOT_REUSABLE.to_string(),
+                "true".to_string(),
+            )]))
+        };
+        fields.push(Arc::new(field));
         columns.push(stats_array);
     }
 
@@ -211,7 +250,7 @@ fn materialize_stats_array(
     stats_schema: KernelSchemaRef,
     stats_arrow_fields: &Fields,
     stats_materialization: &FileStatsMaterialization,
-) -> DeltaResult<Option<Arc<StructArray>>> {
+) -> DeltaResult<Option<(Arc<StructArray>, bool)>> {
     match stats_materialization.stats_source_policy() {
         StatsSourcePolicy::None => Ok(None),
         StatsSourcePolicy::ParsedWithJsonFallback => {
@@ -225,7 +264,7 @@ fn materialize_stats_array(
                         msg: "stats_parsed column is not a struct".to_string(),
                     })?;
                 match project_struct_array(parsed, stats_arrow_fields) {
-                    Ok(projected) => return Ok(Some(Arc::new(projected))),
+                    Ok(projected) => return Ok(Some((Arc::new(projected), true))),
                     Err(err) => {
                         debug!(
                             "existing stats_parsed did not satisfy requested stats schema; falling back to raw stats: {err}"
@@ -239,15 +278,24 @@ fn materialize_stats_array(
             {
                 return Err(err);
             }
-            parse_raw_stats_array(batch, stats_schema).map(Some)
+            parse_raw_stats_array(batch, stats_schema, stats_arrow_fields).map(Some)
         }
     }
 }
 
+/// Parses the raw JSON stats with `stats_schema`. Returns the array and whether it may be reused
+/// in place of a later parse.
+///
+/// `tightBounds` was added to the stats schema so stored stats cover the kernel's. A value of the
+/// wrong type there fails the strict decode, while the same file decoded fine before the field was
+/// added. In that case decode without `tightBounds`, which gives the values earlier builds stored,
+/// fill it with nulls, and mark the batch not reusable: the kernel's own parse of that batch fails
+/// on the same value and keeps no stats, so reused stats would prune more than a fresh parse.
 fn parse_raw_stats_array(
     batch: &RecordBatch,
     stats_schema: KernelSchemaRef,
-) -> DeltaResult<Arc<StructArray>> {
+    stats_arrow_fields: &Fields,
+) -> DeltaResult<(Arc<StructArray>, bool)> {
     let Some((stats_idx, _)) = batch.schema_ref().column_with_name(FIELD_STATS) else {
         return Err(DeltaTableError::SchemaMismatch {
             msg: "stats column not found".to_string(),
@@ -255,12 +303,42 @@ fn parse_raw_stats_array(
     };
 
     let stats_batch = batch.project(&[stats_idx])?;
-    let stats_data = Box::new(ArrowEngineData::new(stats_batch));
+    let decode = |schema: KernelSchemaRef| -> DeltaResult<StructArray> {
+        let parsed = parse_json(Box::new(ArrowEngineData::new(stats_batch.clone())), schema)?;
+        let parsed: RecordBatch = ArrowEngineData::try_from_engine_data(parsed)?.into();
+        Ok(parsed.into())
+    };
 
-    let parsed = parse_json(stats_data, stats_schema)?;
-    let parsed: RecordBatch = ArrowEngineData::try_from_engine_data(parsed)?.into();
-
-    Ok(Arc::new(parsed.into()))
+    let error = match decode(stats_schema.clone()) {
+        Ok(parsed) => return Ok((Arc::new(parsed), true)),
+        Err(error) => error,
+    };
+    let Some(tight_idx) = stats_arrow_fields
+        .iter()
+        .position(|field| field.name() == TIGHT_BOUNDS)
+    else {
+        return Err(error);
+    };
+    let without = StructType::try_new(
+        stats_schema
+            .fields()
+            .filter(|field| field.name() != TIGHT_BOUNDS)
+            .cloned(),
+    )?;
+    let Ok(parsed) = decode(Arc::new(without)) else {
+        return Err(error);
+    };
+    debug!(
+        "stats JSON did not decode with tightBounds; stored stats for this batch are not reusable: {error}"
+    );
+    let mut columns = parsed.columns().to_vec();
+    columns.insert(
+        tight_idx,
+        new_null_array(stats_arrow_fields[tight_idx].data_type(), parsed.len()),
+    );
+    let parsed =
+        StructArray::try_new(stats_arrow_fields.clone(), columns, parsed.nulls().cloned())?;
+    Ok((Arc::new(parsed), false))
 }
 
 fn project_struct_array(

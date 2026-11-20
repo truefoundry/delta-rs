@@ -48,11 +48,14 @@ use crate::kernel::{ARROW_HANDLER, StructType, spawn_blocking_with_span};
 use crate::logstore::{LogStore, LogStoreExt};
 use crate::{DeltaResult, DeltaTableError};
 
+use self::iterators::STATS_PARSED_NOT_REUSABLE;
 pub use self::log_data::*;
 use self::stats_projection::FIELD_STATS;
 pub(crate) use self::stats_projection::{
     FIELD_STATS_PARSED, FileStatsMaterialization, StatsProjection,
 };
+use crate::kernel::arrow::engine_ext::SnapshotExt as _;
+use delta_kernel::schema::DataType as KernelDataType;
 pub use iterators::*;
 pub use scan::*;
 pub use stream::*;
@@ -735,6 +738,7 @@ impl Snapshot {
                     FileMaterializationOptions {
                         stats_mode,
                         skip_stats,
+                        reuse_stats_parsed: false,
                     },
                 )
             }
@@ -765,24 +769,6 @@ impl Snapshot {
         )
     }
 
-    fn files_from_preserving_raw<T: Iterator<Item = RecordBatch> + Send + 'static>(
-        &self,
-        engine: Arc<dyn Engine>,
-        predicate: Option<PredicateRef>,
-        existing_version: Version,
-        existing_data: Box<T>,
-        existing_predicate: Option<PredicateRef>,
-    ) -> SendableRBStream {
-        self.files_from_materialized(
-            engine,
-            predicate,
-            existing_version,
-            existing_data,
-            existing_predicate,
-            FileStatsMode::FullPreserveRaw,
-        )
-    }
-
     fn files_from_materialized<T: Iterator<Item = RecordBatch> + Send + 'static>(
         &self,
         engine: Arc<dyn Engine>,
@@ -801,6 +787,7 @@ impl Snapshot {
             FileMaterializationOptions {
                 stats_mode,
                 skip_stats: false,
+                reuse_stats_parsed: false,
             },
         )
     }
@@ -821,7 +808,13 @@ impl Snapshot {
         let stats_materialization = scan.stats_materialization().clone();
 
         let stream = scan
-            .scan_metadata_from(engine, existing_version, existing_data, existing_predicate)
+            .scan_metadata_from_with_stats(
+                engine,
+                existing_version,
+                existing_data,
+                existing_predicate,
+                options.reuse_stats_parsed,
+            )
             .map(|d| Ok(rb_from_scan_meta(d?)?));
 
         match ScanRowOutStream::try_new_with_materialization(
@@ -878,27 +871,70 @@ impl Snapshot {
             return Ok(self);
         }
 
-        let batches = match materialized_seed.and_then(|seed| seed.full_table_seed()) {
-            Some(materialized_seed) => {
-                let (existing_version, existing_data, existing_predicate) =
-                    materialized_seed.into_parts();
-                self.files_from_preserving_raw(
-                    engine,
-                    None,
-                    existing_version,
-                    Box::new(existing_data),
-                    existing_predicate,
-                )
-                .try_collect()
-                .await?
-            }
-            None => {
-                self.files_with_engine_preserving_raw(engine, None)
-                    .try_collect()
-                    .await?
-            }
-        };
-        let materialized_files = Arc::new(MaterializedFiles::full(self.as_ref(), batches));
+        // Provenance follows how the kernel builds the file list. A seeded replay keeps the seed's
+        // rows (reused only when they were parsed from JSON) and parses JSON for new commits, so
+        // it inherits the seed's provenance. But when the target has a checkpoint newer than the
+        // seed, the kernel drops the seed and replays that checkpoint, which is a fresh load.
+        let (batches, stats_parsed_from_json) =
+            match materialized_seed.and_then(|seed| seed.full_table_seed()) {
+                Some(materialized_seed) => {
+                    let replays_checkpoint = matches!(
+                        self.inner.log_segment().checkpoint_version,
+                        Some(v) if v > materialized_seed.version
+                    );
+                    let from_json = if !stats_reuse_enabled() {
+                        false
+                    } else if replays_checkpoint {
+                        checkpoint_stats_from_json_in_background(&self.inner, &engine).await
+                    } else {
+                        materialized_seed.stats_parsed_from_json
+                    };
+                    // The kernel won't read a seed it drops, so don't offer one: the reuse event
+                    // then reports what replay does, and no unused evaluator is built.
+                    let reuse_stats_parsed = if replays_checkpoint && stats_reuse_enabled() {
+                        tracing::debug!(
+                            target: "deltalake::stats_reuse",
+                            reason = "a newer checkpoint replaces the seed",
+                            "stored stats_parsed not reusable"
+                        );
+                        false
+                    } else {
+                        materialized_seed.stats_parsed_reusable(&self.inner)
+                    };
+                    let (existing_version, existing_data, existing_predicate) =
+                        materialized_seed.into_parts();
+                    let batches = self
+                        .files_from_materialized_with_options(
+                            engine,
+                            None,
+                            existing_version,
+                            Box::new(existing_data),
+                            existing_predicate,
+                            FileMaterializationOptions {
+                                stats_mode: FileStatsMode::FullPreserveRaw,
+                                skip_stats: false,
+                                reuse_stats_parsed,
+                            },
+                        )
+                        .try_collect()
+                        .await?;
+                    (batches, from_json)
+                }
+                None => {
+                    let from_json = stats_reuse_enabled()
+                        && checkpoint_stats_from_json_in_background(&self.inner, &engine).await;
+                    let batches = self
+                        .files_with_engine_preserving_raw(engine, None)
+                        .try_collect()
+                        .await?;
+                    (batches, from_json)
+                }
+            };
+        let materialized_files = Arc::new(MaterializedFiles::full(
+            self.as_ref(),
+            batches,
+            stats_parsed_from_json,
+        ));
         Ok(Arc::new(
             self.with_materialized_files(Some(materialized_files)),
         ))
@@ -1103,6 +1139,9 @@ enum FileStatsMode {
 struct FileMaterializationOptions {
     stats_mode: FileStatsMode,
     skip_stats: bool,
+    /// Let the kernel reuse the existing data's `stats_parsed`; see
+    /// [`MaterializedFilesSeed::stats_parsed_reusable`].
+    reuse_stats_parsed: bool,
 }
 
 /// Scope for materialized file replay data.
@@ -1118,6 +1157,11 @@ pub(crate) struct MaterializedFiles {
     pub(crate) scope: MaterializedFilesScope,
     pub(crate) existing_predicate: Option<PredicateRef>,
     pub(crate) batches: Arc<[RecordBatch]>,
+    /// Whether every stored `stats_parsed` value is what parsing the file's JSON stats gives.
+    /// False when the file list came from replaying a checkpoint with typed stats (see
+    /// [`checkpoint_stats_from_json`]), and for caches restored from a serialized payload. Only such
+    /// stats may replace the kernel's JSON parse; see [`MaterializedFilesSeed::stats_parsed_reusable`].
+    stats_parsed_from_json: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1125,9 +1169,75 @@ struct MaterializedFilesSeed {
     version: Version,
     existing_predicate: Option<PredicateRef>,
     batches: Arc<[RecordBatch]>,
+    stats_parsed_from_json: bool,
 }
 
 impl MaterializedFilesSeed {
+    /// True when the stored `stats_parsed` values may replace the kernel's JSON parse for
+    /// `snapshot`: they must equal what that parse would give. Any other case keeps today's JSON
+    /// path for the whole scan.
+    pub(crate) fn stats_parsed_reusable(&self, snapshot: &KernelSnapshot) -> bool {
+        match self.stats_parsed_reuse_blocker(snapshot) {
+            None => true,
+            Some(reason) => {
+                tracing::debug!(
+                    target: "deltalake::stats_reuse",
+                    reason,
+                    "stored stats_parsed not reusable"
+                );
+                false
+            }
+        }
+    }
+
+    fn stats_parsed_reuse_blocker(&self, snapshot: &KernelSnapshot) -> Option<&'static str> {
+        if !stats_reuse_enabled() {
+            return Some("reuse is off (DELTA_KERNEL_REUSE_CACHED_STATS)");
+        }
+        if !self.stats_parsed_from_json {
+            return Some("stored stats may come from a typed checkpoint");
+        }
+        if self.batches.is_empty() {
+            return Some("no stored batches");
+        }
+        let Ok(expected) = snapshot.scan_row_parsed_schema_arrow() else {
+            return Some("no parsed scan row schema");
+        };
+        let Ok(expected) = expected.field_with_name(FIELD_STATS_PARSED) else {
+            return Some("no stats_parsed in the parsed scan row schema");
+        };
+        for batch in self.batches.iter() {
+            let schema = batch.schema_ref();
+            let Ok(field) = schema.field_with_name(FIELD_STATS_PARSED) else {
+                return Some("a batch has no stats_parsed");
+            };
+            // The type is the stats schema the values were parsed with: field names (physical
+            // column names), order, nesting, types and nullability.
+            if field.data_type() != expected.data_type() {
+                return Some("a batch has a different stats_parsed type");
+            }
+            if field.metadata().contains_key(STATS_PARSED_NOT_REUSABLE) {
+                return Some("a batch's stats did not decode with the full stats schema");
+            }
+            let Some(raw) = batch.column_by_name(FIELD_STATS) else {
+                return Some("a batch has no raw stats");
+            };
+            // Replay passes cached JSON through, but rebuilds it from stats_parsed where it is
+            // null; and a null stats_parsed next to present JSON is a failed parse whose cause may
+            // since have been removed. Either way a fresh parse can differ.
+            if raw.null_count() > 0 {
+                return Some("a stored file has no raw stats");
+            }
+            if batch
+                .column_by_name(FIELD_STATS_PARSED)
+                .is_some_and(|parsed| parsed.null_count() > 0)
+            {
+                return Some("a batch's stats failed to parse");
+            }
+        }
+        None
+    }
+
     fn into_parts(self) -> (Version, SharedRecordBatchIter, Option<PredicateRef>) {
         (
             self.version,
@@ -1172,7 +1282,7 @@ impl Iterator for SharedRecordBatchIter {
 }
 
 impl MaterializedFiles {
-    fn full(snapshot: &Snapshot, batches: Vec<RecordBatch>) -> Self {
+    fn full(snapshot: &Snapshot, batches: Vec<RecordBatch>, stats_parsed_from_json: bool) -> Self {
         let identity = snapshot.identity();
         Self {
             identity,
@@ -1180,6 +1290,7 @@ impl MaterializedFiles {
             scope: MaterializedFilesScope::FullTable,
             existing_predicate: None,
             batches: batches.into(),
+            stats_parsed_from_json,
         }
     }
 
@@ -1206,8 +1317,52 @@ impl MaterializedFiles {
                 version: self.identity.version,
                 existing_predicate: self.existing_predicate.clone(),
                 batches: self.batches.clone(),
+                stats_parsed_from_json: self.stats_parsed_from_json,
             }),
         }
+    }
+}
+
+async fn checkpoint_stats_from_json_in_background(
+    snapshot: &Arc<KernelSnapshot>,
+    engine: &Arc<dyn Engine>,
+) -> bool {
+    let (snapshot, engine) = (Arc::clone(snapshot), Arc::clone(engine));
+    spawn_blocking_with_span(move || checkpoint_stats_from_json(&snapshot, engine.as_ref()))
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether stored `stats_parsed` may replace the kernel's JSON parse. Follows the kernel's
+/// process-wide `DELTA_KERNEL_REUSE_CACHED_STATS` switch, so delta-rs and the kernel never
+/// disagree. Off, delta-rs behaves as before the change: no reuse, no provenance lookup, and the
+/// original stats schema (without `tightBounds`). Unit tests of this crate run with it on.
+pub(crate) fn stats_reuse_enabled() -> bool {
+    cfg!(test) || delta_kernel::scan::reuse_cached_stats_enabled()
+}
+
+/// Whether replaying `snapshot`'s checkpoint gives `stats_parsed` values parsed from JSON.
+///
+/// True without a checkpoint, or when the file actions the kernel replays (the checkpoint's, or
+/// its first sidecar's when it references sidecars) have no `add.stats_parsed`: every row's stats
+/// then come from parsing `add.stats`, as on the per-scan path. The kernel reports that schema
+/// itself, so this follows sidecars exactly when replay does, whatever the protocol declares.
+/// Typed stats give false whatever their shape. A footer can't show that they hold the JSON's
+/// values: a writer that narrows and then widens the indexed columns leaves null bounds under a
+/// complete schema, and nothing rules out stale non-null bounds. Typed-only checkpoints also
+/// differ: the per-scan path parses JSON rebuilt from the typed values, which rounds timestamps
+/// to milliseconds. A schema the kernel can't determine gives false.
+fn checkpoint_stats_from_json(snapshot: &KernelSnapshot, engine: &dyn Engine) -> bool {
+    let log_segment = snapshot.log_segment();
+    if log_segment.listed.checkpoint_parts.is_empty() {
+        return true;
+    }
+    match log_segment.checkpoint_file_actions_schema(engine) {
+        Ok(Some(schema)) => match schema.field("add").map(|f| f.data_type()) {
+            Some(KernelDataType::Struct(add)) => add.field("stats_parsed").is_none(),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1934,7 +2089,7 @@ mod tests {
         let target = Snapshot::try_new(log_store.as_ref(), Some(12)).await?;
         let expected = active_add_paths(&target, log_store.as_ref()).await?;
 
-        let mut mismatched_cache = MaterializedFiles::full(&target, vec![]);
+        let mut mismatched_cache = MaterializedFiles::full(&target, vec![], false);
         mismatched_cache.identity.table_root = Url::parse("memory:///other/")?;
         let cached = Arc::new(target.with_materialized_files(Some(Arc::new(mismatched_cache))));
 
@@ -2893,11 +3048,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_parsed_reusable_requires_exact_type_on_every_batch() -> TestResult {
+        use arrow::array::{Array as _, AsArray as _, StructArray};
+        let (_table_dir, table) = selective_stats_table().await?;
+        let eager = EagerSnapshot::try_new(table.log_store().as_ref(), None).await?;
+        let snapshot = eager.snapshot();
+        let good = snapshot
+            .materialized_files()
+            .and_then(|files| files.full_table_seed())
+            .expect("eager snapshot has a full-table seed");
+        let batch = good.batches[0].clone();
+        let seed = |batches: Vec<RecordBatch>| MaterializedFilesSeed {
+            version: good.version,
+            existing_predicate: None,
+            batches: batches.into(),
+            stats_parsed_from_json: true,
+        };
+        assert!(
+            good.stats_parsed_reusable(&snapshot.inner),
+            "stored stats built by this snapshot are reusable"
+        );
+        assert!(!seed(vec![]).stats_parsed_reusable(&snapshot.inner));
+
+        let stats_idx = batch.schema().index_of(FIELD_STATS_PARSED)?;
+        let without_stats: Vec<usize> = (0..batch.num_columns())
+            .filter(|idx| *idx != stats_idx)
+            .collect();
+        let missing = batch.project(&without_stats)?;
+        assert!(
+            !seed(vec![batch.clone(), missing]).stats_parsed_reusable(&snapshot.inner),
+            "one batch without stats_parsed turns reuse off for the whole scan"
+        );
+
+        // Drop the last stats field (tightBounds): the shape the fork stored before this change.
+        let stats = batch.column(stats_idx).as_struct();
+        let keep = stats.num_columns() - 1;
+        let narrower = StructArray::try_new(
+            stats.fields()[..keep].to_vec().into(),
+            stats.columns()[..keep].to_vec(),
+            stats.nulls().cloned(),
+        )?;
+        let mut fields = batch.schema().fields().to_vec();
+        fields[stats_idx] = Arc::new(arrow_schema::Field::new(
+            FIELD_STATS_PARSED,
+            narrower.data_type().clone(),
+            true,
+        ));
+        let mut columns = batch.columns().to_vec();
+        columns[stats_idx] = Arc::new(narrower);
+        let mistyped = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)?;
+        assert!(
+            !seed(vec![batch.clone(), mistyped]).stats_parsed_reusable(&snapshot.inner),
+            "one batch with a different stats type turns reuse off"
+        );
+
+        // Same columns, but stats configured for one column: the expected type changes, as after
+        // a schema or table-property change between the stored version and the scan's version.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other =
+            DeltaTable::try_from_url(url::Url::from_directory_path(other_dir.path()).unwrap())
+                .await?
+                .create()
+                .with_columns([
+                    StructField::new("value", DataType::Primitive(PrimitiveType::Long), true),
+                    StructField::new("other", DataType::Primitive(PrimitiveType::Long), true),
+                ])
+                .with_configuration_property(TableProperty::DataSkippingNumIndexedCols, Some("1"))
+                .await?;
+        let other = Snapshot::try_new(other.log_store().as_ref(), None).await?;
+        assert!(
+            !good.stats_parsed_reusable(&other.inner),
+            "stats stored under a different stats schema are not reusable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_null_raw_stats_null() -> TestResult {
+        use arrow::array::{Array as _, AsArray as _};
+        let (_table_dir, mut table) = local_test_table().await?;
+        append_test_add(&mut table, "part-00000.snappy.parquet").await?;
+        let mut eager = EagerSnapshot::try_new(table.log_store().as_ref(), None).await?;
+        let seed = eager
+            .snapshot()
+            .materialized_files()
+            .and_then(|files| files.full_table_seed())
+            .expect("seed");
+        assert!(
+            !seed.stats_parsed_reusable(&eager.snapshot().inner),
+            "a file without raw stats keeps replay on the JSON path"
+        );
+
+        append_test_add_with_stats(
+            &mut table,
+            "part-00001.snappy.parquet",
+            r#"{"numRecords":1}"#,
+        )
+        .await?;
+        eager.update(table.log_store().as_ref(), None).await?;
+        let batches = &eager
+            .snapshot()
+            .materialized_files()
+            .expect("materialized files")
+            .batches;
+        let mut raw = Vec::new();
+        for batch in batches.iter() {
+            let paths = batch
+                .column_by_name("path")
+                .expect("path")
+                .as_string::<i32>();
+            let stats = batch
+                .column_by_name(FIELD_STATS)
+                .expect("stats")
+                .as_string::<i32>();
+            for row in 0..batch.num_rows() {
+                raw.push((
+                    paths.value(row).to_string(),
+                    stats.is_valid(row).then(|| stats.value(row).to_string()),
+                ));
+            }
+        }
+        raw.sort();
+        assert_eq!(
+            raw,
+            vec![
+                ("part-00000.snappy.parquet".to_string(), None),
+                (
+                    "part-00001.snappy.parquet".to_string(),
+                    Some(r#"{"numRecords":1}"#.to_string())
+                ),
+            ],
+            "raw stats pass through a refresh unchanged, including null"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_materialized_files_full_table_seed_shares_batches() -> TestResult {
         let log_store = TestTables::Simple.table_builder()?.build_storage()?;
         let snapshot = Snapshot::try_new(&log_store, None).await?;
         let batch = RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
-        let materialized_files = MaterializedFiles::full(&snapshot, vec![batch]);
+        let materialized_files = MaterializedFiles::full(&snapshot, vec![batch], true);
 
         let seed = materialized_files
             .full_table_seed()

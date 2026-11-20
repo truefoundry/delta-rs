@@ -19,16 +19,15 @@ repository = "https://github.com/delta-io/delta.rs"
 #delta_kernel = { package = "buoyant_kernel", path = "../delta-kernel-rs/kernel", features = [
 #delta_kernel = { package = "buoyant_kernel", git = "https://github.com/buoyant-data/delta-kernel-rs", rev = "ab66589067127b81c87690370e9b2c6e5129bcdf", features = [
 #delta_kernel = { package = "buoyant_kernel", git = "https://github.com/truefoundry/delta-kernel-rs-v2", branch = "tf-0.28.0", version = "0.28.0", features = [
-# stats_reuse: the kernel branch under review (rrampage/delta-kernel-rs is a personal fork of
-# truefoundry/delta-kernel-rs-v2). Switch back to the truefoundry repo once it merges.
-delta_kernel = { package = "buoyant_kernel", git = "https://github.com/rrampage/delta-kernel-rs", branch = "stats_reuse", version = "0.28.0", features = [
+# stats_reuse: the kernel branch under review. Switch back to tf-0.28.0 once it merges.
+delta_kernel = { package = "buoyant_kernel", git = "https://github.com/truefoundry/delta-kernel-rs-v2", branch = "stats_reuse", version = "0.28.0", features = [
     "arrow-59",
     "internal-api",
 ] }
 #delta_kernel_default_engine = {  package = "buoyant_kernel_engine",  path = "../delta-kernel-rs/default-engine", features = ["arrow-59", "rustls"], default-features = false }
 #delta_kernel_default_engine = {  package = "buoyant_kernel_engine",  git = "https://github.com/buoyant-data/delta-kernel-rs", rev = "ab66589067127b81c87690370e9b2c6e5129bcdf", features = ["arrow-59", "rustls"], default-features = false }
 #delta_kernel_default_engine = {  package = "buoyant_kernel_engine",  git = "https://github.com/truefoundry/delta-kernel-rs-v2", branch = "tf-0.28.0", version = "0.28.0", features = ["arrow-59", "rustls"], default-features = false }
-delta_kernel_default_engine = {  package = "buoyant_kernel_engine",  git = "https://github.com/rrampage/delta-kernel-rs", branch = "stats_reuse", version = "0.28.0", features = ["arrow-59", "rustls"], default-features = false }
+delta_kernel_default_engine = {  package = "buoyant_kernel_engine",  git = "https://github.com/truefoundry/delta-kernel-rs-v2", branch = "stats_reuse", version = "0.28.0", features = ["arrow-59", "rustls"], default-features = false }
 
 
 # arrow

@@ -8,7 +8,9 @@ on:
 jobs:
   cleanup:
     name: Cleanup PR Caches
-    runs-on: ubuntu-slim
+    runs-on:
+      group: public-runner-group
+      labels: "gh-pb-runners-2c"
     if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
     permissions:
       actions: write

@@ -187,7 +187,9 @@ jobs:
       ]
     permissions:
       contents: write
-    runs-on: ubuntu-slim
+    runs-on:
+      group: public-runner-group
+      labels: "gh-pb-runners-2c"
     steps:
       - name: Trigger the docs release event
         # <https://github.com/peter-evans/repository-dispatch/releases/tag/v4.0.1>

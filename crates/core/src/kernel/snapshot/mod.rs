@@ -871,10 +871,12 @@ impl Snapshot {
             return Ok(self);
         }
 
-        // Provenance follows how the kernel builds the file list. A seeded replay keeps the seed's
-        // rows (reused only when they were parsed from JSON) and parses JSON for new commits, so
-        // it inherits the seed's provenance. But when the target has a checkpoint newer than the
-        // seed, the kernel drops the seed and replays that checkpoint, which is a fresh load.
+        // Provenance follows how the kernel builds the file list. A seeded replay parses JSON for
+        // new commits. It keeps the seed's stored stats only when they are reused, which requires
+        // the seed to be from JSON; otherwise it drops them and parses the seed's JSON again.
+        // Either way the result is from JSON, even when the seed's provenance was unknown (a
+        // restored cache). But when the target has a checkpoint newer than the seed, the kernel
+        // drops the seed and replays that checkpoint, which is a fresh load.
         let (batches, stats_parsed_from_json) =
             match materialized_seed.and_then(|seed| seed.full_table_seed()) {
                 Some(materialized_seed) => {
@@ -882,13 +884,6 @@ impl Snapshot {
                         self.inner.log_segment().checkpoint_version,
                         Some(v) if v > materialized_seed.version
                     );
-                    let from_json = if !stats_reuse_enabled() {
-                        false
-                    } else if replays_checkpoint {
-                        checkpoint_stats_from_json_in_background(&self.inner, &engine).await
-                    } else {
-                        materialized_seed.stats_parsed_from_json
-                    };
                     // The kernel won't read a seed it drops, so don't offer one: the reuse event
                     // then reports what replay does, and no unused evaluator is built.
                     let reuse_stats_parsed = if replays_checkpoint && stats_reuse_enabled() {
@@ -900,6 +895,16 @@ impl Snapshot {
                         false
                     } else {
                         materialized_seed.stats_parsed_reusable(&self.inner)
+                    };
+                    let from_json = if !stats_reuse_enabled() {
+                        false
+                    } else if replays_checkpoint {
+                        checkpoint_stats_from_json_in_background(&self.inner, &engine).await
+                    } else if reuse_stats_parsed {
+                        // True: reuse requires a seed whose stats are from JSON.
+                        materialized_seed.stats_parsed_from_json
+                    } else {
+                        true
                     };
                     let (existing_version, existing_data, existing_predicate) =
                         materialized_seed.into_parts();
@@ -1159,8 +1164,9 @@ pub(crate) struct MaterializedFiles {
     pub(crate) batches: Arc<[RecordBatch]>,
     /// Whether every stored `stats_parsed` value is what parsing the file's JSON stats gives.
     /// False when the file list came from replaying a checkpoint with typed stats (see
-    /// [`checkpoint_stats_from_json`]), and for caches restored from a serialized payload. Only such
-    /// stats may replace the kernel's JSON parse; see [`MaterializedFilesSeed::stats_parsed_reusable`].
+    /// [`checkpoint_stats_from_json`]), and for caches restored from a serialized payload until a
+    /// refresh parses their JSON again. Only such stats may replace the kernel's JSON parse; see
+    /// [`MaterializedFilesSeed::stats_parsed_reusable`].
     stats_parsed_from_json: bool,
 }
 
@@ -3120,6 +3126,93 @@ mod tests {
             !good.stats_parsed_reusable(&other.inner),
             "stats stored under a different stats schema are not reusable"
         );
+        Ok(())
+    }
+
+    /// Per file, sorted by path: path, raw stats, and the stored `stats_parsed` value.
+    fn materialized_stats_rows(
+        snapshot: &EagerSnapshot,
+    ) -> Vec<(String, Option<String>, arrow::array::ArrayData)> {
+        use arrow::array::{Array as _, AsArray as _};
+        let files = snapshot
+            .snapshot()
+            .materialized_files()
+            .expect("materialized files");
+        let mut rows = Vec::new();
+        for batch in files.batches.iter() {
+            let paths = batch
+                .column_by_name("path")
+                .expect("path")
+                .as_string::<i32>();
+            let raw = batch
+                .column_by_name(FIELD_STATS)
+                .expect("stats")
+                .as_string::<i32>();
+            let parsed = batch
+                .column_by_name(FIELD_STATS_PARSED)
+                .expect("stats_parsed");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    paths.value(row).to_string(),
+                    raw.is_valid(row).then(|| raw.value(row).to_string()),
+                    parsed.slice(row, 1).to_data(),
+                ));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    fn seed_reusable(snapshot: &EagerSnapshot) -> bool {
+        snapshot
+            .snapshot()
+            .materialized_files()
+            .and_then(|files| files.full_table_seed())
+            .expect("seed")
+            .stats_parsed_reusable(&snapshot.snapshot().inner)
+    }
+
+    #[tokio::test]
+    async fn restored_cache_regains_stats_reuse_after_refresh() -> TestResult {
+        let (_table_dir, mut table) = local_test_table().await?;
+        let stats = |id: i32| {
+            format!(
+                r#"{{"numRecords":1,"minValues":{{"id":{id}}},"maxValues":{{"id":{id}}},"nullCount":{{"id":0}}}}"#
+            )
+        };
+        append_test_add_with_stats(&mut table, "part-00000.snappy.parquet", &stats(0)).await?;
+        let log_store = table.log_store();
+        let eager = EagerSnapshot::try_new(log_store.as_ref(), None).await?;
+        assert!(seed_reusable(&eager), "a fresh JSON load is reusable");
+
+        let mut restored: EagerSnapshot = serde_json::from_value(serde_json::to_value(&eager)?)?;
+        assert!(
+            !seed_reusable(&restored),
+            "a restored cache has unknown provenance"
+        );
+
+        // The refresh can't reuse the restored stats, so it parses every file's JSON.
+        append_test_add_with_stats(&mut table, "part-00001.snappy.parquet", &stats(1)).await?;
+        restored.update(log_store.as_ref(), None).await?;
+        assert!(
+            seed_reusable(&restored),
+            "a refresh that parsed every file's JSON is reusable again"
+        );
+        let fresh = EagerSnapshot::try_new(log_store.as_ref(), None).await?;
+        assert_eq!(
+            materialized_stats_rows(&restored),
+            materialized_stats_rows(&fresh)
+        );
+
+        // This refresh reuses the stored stats and must still match a fresh load.
+        append_test_add_with_stats(&mut table, "part-00002.snappy.parquet", &stats(2)).await?;
+        restored.update(log_store.as_ref(), None).await?;
+        let fresh = EagerSnapshot::try_new(log_store.as_ref(), None).await?;
+        assert_eq!(
+            materialized_stats_rows(&restored),
+            materialized_stats_rows(&fresh)
+        );
+        assert!(seed_reusable(&restored));
         Ok(())
     }
 

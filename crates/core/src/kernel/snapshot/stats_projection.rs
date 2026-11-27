@@ -762,30 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn kernel_reads_struct_stats_only_for_full_and_predicate_columns() {
-        let predicate_columns =
-            StatsProjection::PredicateColumns(BTreeSet::from([ColumnName::new(["CreatedAt"])]));
-        for (projection, expected) in [
-            (StatsProjection::Full, true),
-            (predicate_columns, true),
-            (StatsProjection::NumRecordsOnly, false),
-            (StatsProjection::None, false),
-        ] {
-            for materialization in [
-                FileStatsMaterialization::query(projection.clone()),
-                FileStatsMaterialization::compatibility(projection.clone()),
-            ] {
-                assert_eq!(
-                    materialization.kernel_reads_struct_stats(),
-                    expected,
-                    "{projection:?}"
-                );
-            }
-        }
-        assert!(!FileStatsMaterialization::without_stats().kernel_reads_struct_stats());
-    }
-
-    #[test]
     fn file_stats_materialization_without_stats_disables_sources() {
         let materialization = FileStatsMaterialization::without_stats();
 

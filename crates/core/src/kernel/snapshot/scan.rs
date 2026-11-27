@@ -158,18 +158,21 @@ fn with_kernel_stats_output(
     builder: KernelScanBuilder,
     materialization: &FileStatsMaterialization,
 ) -> KernelScanBuilder {
-    let stats_opts = if materialization.kernel_reads_struct_stats() {
-        // Cached replay requires JSON stats in Kernel's base scan schema.
-        if materialization.preserves_raw_stats() {
-            delta_kernel::scan::StatsOptions::all()
-        } else {
-            // TODO: Pass selected columns to `StatsOptions::struct_columns`.
-            delta_kernel::scan::StatsOptions::all_struct()
-        }
-    } else if materialization.stats_source_policy() == StatsSourcePolicy::None {
-        delta_kernel::scan::StatsOptions::none()
-    } else {
-        delta_kernel::scan::StatsOptions::json_only()
+    let stats_opts = match materialization.stats_source_policy() {
+        StatsSourcePolicy::None => delta_kernel::scan::StatsOptions::none(),
+        StatsSourcePolicy::ParsedWithJsonFallback => match materialization.stats_projection() {
+            StatsProjection::None => delta_kernel::scan::StatsOptions::json_only(),
+            StatsProjection::Full | StatsProjection::PredicateColumns(_) => {
+                // Cached replay requires JSON stats in Kernel's base scan schema.
+                if materialization.preserves_raw_stats() {
+                    delta_kernel::scan::StatsOptions::all()
+                } else {
+                    // TODO: Pass selected columns to `StatsOptions::struct_columns`.
+                    delta_kernel::scan::StatsOptions::all_struct()
+                }
+            }
+            StatsProjection::NumRecordsOnly => delta_kernel::scan::StatsOptions::json_only(),
+        },
     };
 
     builder.with_stats(stats_opts)
@@ -541,8 +544,9 @@ impl Scan {
     /// Like [`Self::scan_metadata_from`]. With `reuse_stats_parsed`, every batch of
     /// `existing_data` must carry `stats_parsed` in this snapshot's full parsed schema; the kernel
     /// then reads it instead of parsing the JSON stats again, falling back to JSON when it is not
-    /// compatible with the scan's stats schema. Scans that don't ask the kernel for typed stats
-    /// (no stats-column predicate) never parse stats in replay, so the column isn't passed.
+    /// compatible with the scan's stats schema. Callers pass it only for scans that ask the kernel
+    /// for typed stats ([`FileStatsMaterialization::kernel_reads_struct_stats`]); other scans never
+    /// parse stats in replay, so there is nothing to reuse.
     pub(crate) fn scan_metadata_from_with_stats<
         T: Iterator<Item = RecordBatch> + Send + 'static,
     >(
@@ -553,8 +557,6 @@ impl Scan {
         existing_predicate: Option<PredicateRef>,
         reuse_stats_parsed: bool,
     ) -> SendableScanMetadataStream {
-        let reuse_stats_parsed =
-            reuse_stats_parsed && self.stats_materialization.kernel_reads_struct_stats();
         tracing::debug!(
             target: "deltalake::stats_reuse",
             reuse = reuse_stats_parsed,

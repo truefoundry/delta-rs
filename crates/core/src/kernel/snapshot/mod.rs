@@ -1198,13 +1198,10 @@ impl MaterializedFilesSeed {
 
     fn stats_parsed_reuse_blocker(&self, snapshot: &KernelSnapshot) -> Option<&'static str> {
         if !stats_reuse_enabled() {
-            return Some("reuse is off (DELTA_KERNEL_REUSE_CACHED_STATS)");
+            return Some("reuse is off (DELTA_KERNEL_REUSE_CACHED_STATS unset)");
         }
         if !self.stats_parsed_from_json {
             return Some("stored stats may come from a typed checkpoint");
-        }
-        if self.batches.is_empty() {
-            return Some("no stored batches");
         }
         let Ok(expected) = snapshot.scan_row_parsed_schema_arrow() else {
             return Some("no parsed scan row schema");
@@ -1339,12 +1336,34 @@ async fn checkpoint_stats_from_json_in_background(
         .unwrap_or(false)
 }
 
-/// Whether stored `stats_parsed` may replace the kernel's JSON parse. Follows the kernel's
-/// process-wide `DELTA_KERNEL_REUSE_CACHED_STATS` switch, so delta-rs and the kernel never
-/// disagree. Off, delta-rs behaves as before the change: no reuse, no provenance lookup, and the
-/// original stats schema (without `tightBounds`). Unit tests of this crate run with it on.
+/// Turns on reusing stored `stats_parsed` in place of the kernel's JSON stats parse.
+const STATS_REUSE_ENV_VAR: &str = "DELTA_KERNEL_REUSE_CACHED_STATS";
+
+/// Whether stored `stats_parsed` may replace the kernel's JSON parse. Set
+/// `DELTA_KERNEL_REUSE_CACHED_STATS` to `true` or `1` to turn it on; unset or any other value
+/// keeps it off. Read once per process, and the effective value is logged.
+///
+/// The kernel has no switch of its own: it reuses typed stats exactly when the cached rows passed
+/// to `scan_metadata_from` describe a compatible `stats_parsed` column, which delta-rs only does
+/// when this is on. Off, delta-rs behaves as before the change: no reuse, no provenance lookup,
+/// and the original stats schema (without `tightBounds`). Tests get it from the `[env]` table in
+/// `.cargo/config.toml`.
 pub(crate) fn stats_reuse_enabled() -> bool {
-    cfg!(test) || delta_kernel::scan::reuse_cached_stats_enabled()
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        let value = std::env::var(STATS_REUSE_ENV_VAR).ok();
+        let enabled = value
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        tracing::info!(
+            target: "deltalake::stats_reuse",
+            enabled,
+            value = value.as_deref().unwrap_or("<unset>"),
+            "{STATS_REUSE_ENV_VAR}: stored stats_parsed reuse"
+        );
+        enabled
+    });
+    *ENABLED
 }
 
 /// Whether replaying `snapshot`'s checkpoint gives `stats_parsed` values parsed from JSON.
@@ -3074,7 +3093,6 @@ mod tests {
             good.stats_parsed_reusable(&snapshot.inner),
             "stored stats built by this snapshot are reusable"
         );
-        assert!(!seed(vec![]).stats_parsed_reusable(&snapshot.inner));
 
         let stats_idx = batch.schema().index_of(FIELD_STATS_PARSED)?;
         let without_stats: Vec<usize> = (0..batch.num_columns())

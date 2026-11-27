@@ -20,3 +20,7 @@ rustflags = [
 # matching what tikv-jemalloc-sys's build.rs expects.
 [env]
 CONFIG_SITE = { value = "/dev/null", force = true }
+# Run tests with stored stats_parsed reuse on (`stats_reuse_enabled()` in
+# crates/core/src/kernel/snapshot/mod.rs), as in production deployments that set it. It is read
+# once per process, so unit and integration tests all see the same value.
+DELTA_KERNEL_REUSE_CACHED_STATS = "1"

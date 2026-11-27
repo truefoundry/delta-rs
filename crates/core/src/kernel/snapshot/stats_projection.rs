@@ -128,6 +128,17 @@ impl FileStatsMaterialization {
     pub(crate) fn retains_stats_field(&self) -> bool {
         self.preserves_raw_stats() || self.stats_source_policy == StatsSourcePolicy::None
     }
+
+    /// Whether the kernel scan is asked for typed stats (`StatsOptions::all` or `all_struct`).
+    /// Only then does the kernel parse stats during replay, so only then can a stored
+    /// `stats_parsed` column replace that parse.
+    pub(crate) fn kernel_reads_struct_stats(&self) -> bool {
+        self.stats_source_policy == StatsSourcePolicy::ParsedWithJsonFallback
+            && matches!(
+                self.stats_projection,
+                StatsProjection::Full | StatsProjection::PredicateColumns(_)
+            )
+    }
 }
 
 impl StatsProjection {

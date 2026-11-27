@@ -163,6 +163,8 @@ impl MaterializedFilesWire {
             scope,
             existing_predicate: None,
             batches: deserialize_batches(self.batches)?.into(),
+            // The payload doesn't say how its stats were parsed.
+            stats_parsed_from_json: false,
         };
 
         Ok(Some(materialized_files))
@@ -193,6 +195,7 @@ fn materialized_files_from_legacy_eager_payload(
     Ok(Some(Arc::new(MaterializedFiles::full(
         snapshot,
         deserialize_batches(legacy_payload)?,
+        false,
     ))))
 }
 
